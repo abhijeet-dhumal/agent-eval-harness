@@ -37,7 +37,7 @@ from harbor.environments.capabilities import (
 )
 from harbor.models.task.config import TaskOS
 
-# For K8s, env is managed via AGENT_EVAL_K8S_CREDENTIALS_SECRET (envFrom secretRef).
+# For K8s, env is managed via AGENT_EVAL_K8S_ENV_SECRET (envFrom secretRef).
 # Only forward model-routing hints that are safe to inherit from the host.
 # Deliberately excludes cloud-provider auth vars (CLAUDE_CODE_USE_VERTEX,
 # ANTHROPIC_VERTEX_PROJECT_ID, CLAUDE_CODE_USE_BEDROCK, AWS_REGION, etc.)
@@ -438,7 +438,9 @@ class KubernetesEnvironment(BaseEnvironment):
         #     stdout) so `kubectl logs -f <pod>` shows live agent output.
         #     Fails silently if /proc/1/fd/1 is not accessible.
         script = f"( {command} ) >{out_f} 2>{err_f}; printf '%s' $? >{rc_f}"
-        relay  = f"tail -f {out_f} >/proc/1/fd/1 2>/dev/null"
+        # exec replaces the sh wrapper with tail directly — rpid_f stores the
+        # actual tail PID so kill $rpid reliably terminates the relay process.
+        relay  = f"exec tail -f {out_f} >/proc/1/fd/1 2>/dev/null"
         self._ws_exec_short(
             f"touch {out_f}; "
             f"sh -c {shlex.quote(script)} & printf '%s' $! >{pid_f}; "
