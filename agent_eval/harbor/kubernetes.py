@@ -29,6 +29,8 @@ import tarfile
 import threading
 import time
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (
@@ -37,16 +39,31 @@ from harbor.environments.capabilities import (
 )
 from harbor.models.task.config import TaskOS
 
-# For K8s, env is managed via AGENT_EVAL_K8S_CREDENTIALS_SECRET (envFrom secretRef).
-# Only forward model-routing hints that are safe to inherit from the host.
-# Deliberately excludes cloud-provider auth vars (CLAUDE_CODE_USE_VERTEX,
-# ANTHROPIC_VERTEX_PROJECT_ID, CLAUDE_CODE_USE_BEDROCK, AWS_REGION, etc.)
-# because those reflect the *developer's* local setup and would override the
-# in-cluster LiteLLM gateway config baked into the K8s secret.
-_FORWARD_ENV = (
-    "ANTHROPIC_MODEL",
+# For K8s, agent/judge routing is managed via AGENT_EVAL_K8S_CREDENTIALS_SECRET
+# (envFrom secretRef). Do not forward ANTHROPIC_BASE_URL from the host: sourced
+# .env often points at LiteLLM for judges, which would override the secret's
+# vLLM URL on the pod (direct env: beats envFrom) and in Harbor exec exports.
+# Harbor's claude-code agent also injects host os.environ into exec; strip those
+# keys in exec() when a credentials secret is configured.
+_FORWARD_ENV: tuple[str, ...] = ()
+
+# Keys owned by the cluster secret — never let Harbor/host exec override them.
+_SECRET_MANAGED_ENV = frozenset({
     "ANTHROPIC_BASE_URL",
-)
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "HF_TOKEN",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+})
 
 try:
     from kubernetes import client as k8s_client, config as k8s_config
@@ -120,8 +137,10 @@ class KubernetesEnvironment(BaseEnvironment):
     """Single-pod Harbor environment backed by the Kubernetes Python client."""
 
     # Patterns Harbor emits during agent setup / install that require root or
-    # a network bootstrap.  Skipped by default for pre-built images; opt out
-    # with AGENT_EVAL_K8S_INSTALL_PACKAGES=1 if using a bare image.
+    # a network bootstrap.  Matched in exec() when
+    # AGENT_EVAL_K8S_SKIP_PKG_INSTALLS=1 so pre-built images (which already
+    # have every dependency baked in) can skip commands that would fail under
+    # OpenShift's restricted-v2 SCC (no root, no internet egress).
     #
     # Covers all branches of claude_code.install() + BaseInstalledAgent.setup():
     #   1. Root pkg installs  – apk add / apt-get install / dnf install / yum install
@@ -134,23 +153,34 @@ class KubernetesEnvironment(BaseEnvironment):
         r"|yum\s+install"
         r"|npm\s+install\s+-g"
         r")\b"
-        r"|curl\s+-fsSL\s+https://(?:downloads\.)?claude\.ai"
+        r"|curl\s+-fsSL\s+https://downloads\.claude\.ai"
     )
 
-    def __init__(self, *args, keep_pods: bool | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        keep_pods: bool | None = None,
+        credentials_secret: str | None = None,
+        k8s_namespace: str | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if not _K8S_AVAILABLE:
             raise RuntimeError(
                 "The 'kubernetes' package is required for KubernetesEnvironment. "
                 "Run `/eval-setup --harbor` or `pip install harbor kubernetes`.")
         self._pod = _pod_name(self.session_id)
-        self._namespace = _default_namespace()
+        self._namespace = k8s_namespace or _default_namespace()
+        self._credentials_secret = (
+            credentials_secret or os.environ.get("AGENT_EVAL_K8S_CREDENTIALS_SECRET")
+        )
         if keep_pods is None:
             keep_pods = os.environ.get("AGENT_EVAL_K8S_KEEP_RUN") == "1"
         self._keep_pods = keep_pods
-        # Pre-built images skip install by default (the norm for K8s/OpenShift).
-        # Opt out with AGENT_EVAL_K8S_INSTALL_PACKAGES=1 if using a bare image.
-        self._skip_pkg_installs = os.environ.get("AGENT_EVAL_K8S_INSTALL_PACKAGES") != "1"
+        # When the task image is pre-built with all required packages, set
+        # AGENT_EVAL_K8S_SKIP_PKG_INSTALLS=1 to suppress install commands that
+        # would fail under OpenShift's restricted-v2 SCC (no root access).
+        self._skip_pkg_installs = os.environ.get("AGENT_EVAL_K8S_SKIP_PKG_INSTALLS") == "1"
         self._started = False
         _load_kube_config()
         self._core = k8s_client.CoreV1Api()
@@ -209,13 +239,8 @@ class KubernetesEnvironment(BaseEnvironment):
         container: dict = {
             "name": "main",
             "image": image,
-            "command": ["sh", "-c",
-                        'while true; do '
-                        'for f in $(find /logs \\( -name "*.log" -o -name "*.txt" \\) 2>/dev/null); do '
-                        'if ! echo "$TAILED" | grep -qF "$f"; then '
-                        'TAILED="$TAILED $f"; '
-                        'tail -F "$f" & '
-                        'fi; done; sleep 5; done'],
+            "imagePullPolicy": "Always",
+            "command": ["sleep", "infinity"],
             "env": [{"name": k, "value": v} for k, v in env.items()],
             "resources": resources,
             "securityContext": {
@@ -241,9 +266,20 @@ class KubernetesEnvironment(BaseEnvironment):
             container["env"].append({
                 "name": "GOOGLE_APPLICATION_CREDENTIALS",
                 "value": f"{_CREDS_MOUNT}/{key}"})
-        env_secret = os.environ.get("AGENT_EVAL_K8S_CREDENTIALS_SECRET")
+        env_secret = self._credentials_secret
         if env_secret:
             container["envFrom"] = [{"secretRef": {"name": env_secret}}]
+            # K8s gives explicit `env` precedence over `envFrom`. Harbor's
+            # ClaudeCodeAgent and templatize_sensitive_env inject/redact keys
+            # matching TOKEN/KEY/SECRET/AUTH. Strip any explicit env entry that:
+            # (a) was redacted to **** by the serializer, OR
+            # (b) is a known secret-managed key — credentials_secret is the
+            #     single source of truth for trial pod env vars.
+            container["env"] = [
+                e for e in container["env"]
+                if e["name"] not in _SECRET_MANAGED_ENV
+                and "****" not in e.get("value", "")
+            ]
 
         # Project resources from a ConfigMap (skills, scripts, .context, CLAUDE.md).
         # Mounted read-only; the agent copies what it needs into /workspace at run
@@ -275,7 +311,11 @@ class KubernetesEnvironment(BaseEnvironment):
         image = self.task_env_config.docker_image
 
         forwarded = {k: os.environ[k] for k in _FORWARD_ENV if os.environ.get(k)}
-        pod_env = {**forwarded, **(self._persistent_env or {})}
+        raw_env = {**forwarded, **(self._persistent_env or {})}
+        pod_env = {
+            k: (os.environ[k] if "****" in v and k in os.environ else v)
+            for k, v in raw_env.items()
+        }
         self._persistent_env = pod_env
         manifest = self._pod_manifest(image, pod_env)
 
@@ -286,33 +326,11 @@ class KubernetesEnvironment(BaseEnvironment):
         except ApiException as exc:
             raise RuntimeError(f"pod create failed: {exc}") from exc
 
-        await self._wait_ready(timeout_sec=300)
+        pod = await self._wait_ready(timeout_sec=300)
         self._started = True
+        await self._bind_policy_proxy_capture(pod)
         await self._upload_environment_dir_after_start()
-        await self._restore_project_from_configmap()
-
-    async def _restore_project_from_configmap(self) -> None:
-        """Reconstruct project tree from flat ConfigMap after environment upload.
-
-        ConfigMap keys use ``--`` instead of ``/``. This copies them into
-        /workspace with the original directory structure so Claude finds
-        skills at ``.claude/skills/``, scripts at ``scripts/``, etc.
-        """
-        project_mount = os.environ.get("AGENT_EVAL_K8S_PROJECT_MOUNT",
-                                       "/opt/project") \
-            if os.environ.get("AGENT_EVAL_K8S_PROJECT_CONFIGMAP") else None
-        if not project_mount:
-            return
-        cmd = (
-            f'for f in {project_mount}/* {project_mount}/.*; do '
-            '[ -f "$f" ] || continue; '
-            'n=$(basename "$f"); '
-            't=$(echo "$n" | sed "s/--/\\//g"); '
-            'mkdir -p "$(dirname "/workspace/$t")"; '
-            'cp "$f" "/workspace/$t"; '
-            'done'
-        )
-        await self._checked_exec(cmd, "restore project from configmap")
+        await self._start_log_streamer()
 
     def _delete_pod_quiet(self) -> None:
         try:
@@ -322,7 +340,7 @@ class KubernetesEnvironment(BaseEnvironment):
             if getattr(exc, "status", None) != 404:
                 self.logger.debug("delete stale pod: %s", exc)
 
-    async def _wait_ready(self, timeout_sec: int) -> None:
+    async def _wait_ready(self, timeout_sec: int):
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
             try:
@@ -335,11 +353,62 @@ class KubernetesEnvironment(BaseEnvironment):
             conds = {c.type: c.status for c in (status.conditions or [])} \
                 if status else {}
             if conds.get("Ready") == "True":
-                return
+                return pod
             if phase in ("Failed", "Succeeded"):
                 raise RuntimeError(f"pod {self._pod} entered phase {phase} before Ready")
             await asyncio.sleep(3)
         raise RuntimeError(f"pod {self._pod} not Ready after {timeout_sec}s")
+
+    def _bind_policy_proxy_capture_sync(self, pod: object) -> None:
+        """Register trial session → pod IP so policy-proxy can serve GRPO tokens."""
+        bind_url = os.environ.get("AGENT_EVAL_POLICY_PROXY_BIND_URL", "").strip()
+        if not bind_url:
+            return
+        status = getattr(pod, "status", None)
+        pod_ip = str(getattr(status, "pod_ip", "") or "").strip()
+        if not pod_ip:
+            self.logger.warning(
+                "policy-proxy capture bind skipped for %s: pod has no IP yet", self._pod)
+            return
+        payload = json.dumps(
+            {"session_id": self.session_id, "client_ip": pod_ip}
+        ).encode()
+        req = Request(
+            bind_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=10) as resp:
+                if resp.status >= 400:
+                    self.logger.warning(
+                        "policy-proxy capture bind returned %s for session %s",
+                        resp.status,
+                        self.session_id,
+                    )
+        except (URLError, TimeoutError, OSError) as exc:
+            self.logger.warning(
+                "policy-proxy capture bind failed for session %s: %s",
+                self.session_id,
+                exc,
+            )
+
+    async def _bind_policy_proxy_capture(self, pod: object) -> None:
+        await asyncio.to_thread(self._bind_policy_proxy_capture_sync, pod)
+
+    async def _start_log_streamer(self) -> None:
+        """Start a background tail -f on /logs/agent/ so kubectl logs shows agent traces."""
+        try:
+            cmd = (
+                "nohup sh -c '"
+                "while [ ! -f /logs/agent/claude-code.txt ]; do sleep 2; done; "
+                "tail -f /logs/agent/claude-code.txt "
+                "' > /proc/1/fd/1 2>/dev/null &"
+            )
+            await asyncio.to_thread(self._ws_exec, cmd, 5)
+        except Exception:
+            pass
 
     async def stop(self, delete: bool) -> None:
         if not self._started:
@@ -380,34 +449,20 @@ class KubernetesEnvironment(BaseEnvironment):
             except Exception:
                 break
 
-    # Retry only failures that happen BEFORE the command starts executing
-    # (the WebSocket never established). At that point nothing ran in the
-    # container, so a retry is safe even for non-idempotent commands like the
-    # agent run. Post-establishment drops/timeouts are NEVER retried here —
-    # re-running a command that may have already executed (the agent!) would be
-    # unsafe; long connections are protected by the keepalive instead.
-    _EXEC_ESTABLISH_RETRIES = 2      # total attempts = retries + 1
-    _EXEC_RETRY_BACKOFF_SEC = 0.5    # 0.5s, 1.0s, ...
+    def _ws_exec(self, command: str, timeout_sec: int | None) -> ExecResult:
+        """WebSocket exec with a keepalive ping for HAProxy resilience.
 
-    def _ws_exec_once(
-        self, command: str, timeout_sec: int | None
-    ) -> tuple[ExecResult, bool, BaseException | None]:
-        """Single WebSocket exec attempt.
+        OpenShift's HAProxy router drops WebSocket connections idle for ≥60 s.
+        Sending a ping frame every 30 s resets the idle timer and keeps the
+        single long-lived connection alive for the full agent run.
 
-        Returns ``(result, established, exc)`` where *established* is True once
-        ``k8s_stream`` has returned a live connection (i.e. the command has been
-        handed to the container). When *established* is False the command
-        provably never ran, so the caller may safely retry.
-
-        A keepalive ping every 30 s resets HAProxy's ≥60 s idle timer so a long
-        agent run survives on a single connection. A daemon thread with a hard
-        wall-clock deadline guards against the ``resp.close()`` /
-        ``read_channel()`` deadlock that occurs when HAProxy silently tears down
-        a connection without a TCP FIN or WebSocket close frame.
+        A daemon thread with a hard wall-clock deadline guards against the
+        ``resp.close()`` / ``read_channel()`` deadlock that occurs when HAProxy
+        silently tears down a connection without sending a TCP FIN or WebSocket
+        close frame.
         """
         result_holder: list[ExecResult] = []
         exc_holder:    list[BaseException] = []
-        established:   list[bool] = []
         stop_ping = threading.Event()
         ws_lock   = threading.Lock()
 
@@ -420,7 +475,6 @@ class KubernetesEnvironment(BaseEnvironment):
                     stderr=True, stdin=False, stdout=True, tty=False,
                     _preload_content=False,
                 )
-                established.append(True)  # connection up — command is now running
                 threading.Thread(
                     target=self._ws_keepalive,
                     args=(resp, 30, stop_ping, ws_lock),
@@ -478,52 +532,14 @@ class KubernetesEnvironment(BaseEnvironment):
         t.join(timeout=hard_limit)
         if t.is_alive():
             stop_ping.set()
-            # The worker is still alive (likely wedged in k8s_stream). It may yet
-            # establish the connection and run the command after we return, so we
-            # must NOT report "never established" — that would let the caller
-            # retry and double-execute a non-idempotent command. Force
-            # established=True so this attempt is treated as non-retryable.
             return ExecResult(
                 stdout="",
                 stderr=f"[ws_exec hard timeout after {hard_limit}s — HAProxy connection dead]",
-                return_code=124), True, None
-        is_established = bool(established)
+                return_code=124)
         if exc_holder:
-            return ExecResult(
-                stdout="", stderr=f"[exec error: {exc_holder[0]}]",
-                return_code=1), is_established, exc_holder[0]
-        result = result_holder[0] if result_holder else ExecResult(
+            raise exc_holder[0]
+        return result_holder[0] if result_holder else ExecResult(
             stdout="", stderr="[no result from exec thread]", return_code=1)
-        return result, is_established, None
-
-    def _ws_exec(self, command: str, timeout_sec: int | None) -> ExecResult:
-        """WebSocket exec, retrying only pre-execution (establishment) failures.
-
-        Wraps :meth:`_ws_exec_once`. A failure where the connection never
-        established (transient HAProxy refusal/drop during ``k8s_stream``) is
-        retried with backoff because the command provably never ran. Any failure
-        after the command started — timeout, mid-stream drop, non-zero exit — is
-        returned/raised as-is so a possibly-executed command is never re-run.
-        """
-        attempts = self._EXEC_ESTABLISH_RETRIES + 1
-        for attempt in range(1, attempts + 1):
-            result, established, exc = self._ws_exec_once(command, timeout_sec)
-            if established:
-                if exc is not None:
-                    raise exc  # post-establishment failure — preserve old contract
-                return result
-            # Not established: the command never started — safe to retry.
-            if attempt < attempts:
-                backoff = self._EXEC_RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-                self.logger.warning(
-                    "exec failed to establish (attempt %d/%d); retrying in %.1fs: %s",
-                    attempt, attempts, backoff, (result.stderr or "")[:160])
-                time.sleep(backoff)
-                continue
-            # Exhausted retries with no establishment.
-            if exc is not None:
-                raise exc
-            return result
 
     async def exec(
         self,
@@ -533,16 +549,16 @@ class KubernetesEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        # `user` is ignored: the pod runs as its SCC-assigned UID and exec can't
-        # switch users. cwd/env are folded into the shell command.
         if self._skip_pkg_installs and self._PKG_INSTALL_RE.search(command):
-            self.logger.debug("skip pkg-install (pre-built image, default for K8s)")
+            self.logger.debug("skip pkg-install: AGENT_EVAL_K8S_SKIP_PKG_INSTALLS=1")
             return ExecResult(stdout="[skipped: pre-built image]", stderr="", return_code=0)
         prefix = ""
         effective_cwd = cwd or self.task_env_config.workdir
         if effective_cwd:
             prefix += f"cd {shlex.quote(effective_cwd)} && "
         if env:
+            if self._credentials_secret or os.environ.get("AGENT_EVAL_K8S_CREDENTIALS_SECRET"):
+                env = {k: v for k, v in env.items() if k not in _SECRET_MANAGED_ENV}
             for key, value in env.items():
                 prefix += f"export {key}={shlex.quote(str(value))}; "
         return await asyncio.to_thread(self._ws_exec, prefix + command, timeout_sec)
@@ -550,45 +566,17 @@ class KubernetesEnvironment(BaseEnvironment):
     # --- file transfer (tar + base64 over exec) -----------------------------
     #
     # cp goes through `exec` + base64 rather than the websocket stdin channel
-    # (which has no clean half-close for tar's EOF). The base64 blob is written
-    # to a temp file in chunks (see _write_b64_chunked) rather than passed as a
-    # single argument: Linux caps one argv entry at MAX_ARG_STRLEN (128 KiB)
-    # regardless of the larger total ARG_MAX, so a big blob as one `printf` arg
-    # fails with E2BIG (this silently broke "upload agent logs back to
-    # environment" for every multi-step trial). Downloads stream out via stdout,
-    # which has no such limit.
-
-    # Stay well under Linux's 128 KiB single-argument cap (MAX_ARG_STRLEN), with
-    # headroom for the rest of the command line.
-    _B64_CHUNK = 100_000
-
-    async def _write_b64_chunked(self, b64: str, remote_path: str, what: str) -> None:
-        """Write a base64 string to *remote_path* in sub-arg-limit chunks.
-
-        Each chunk is one exec (`printf %s <chunk> >> file`); the first truncates,
-        the rest append. Transient establishment failures are retried by _ws_exec.
-        """
-        q = shlex.quote(remote_path)
-        if not b64:
-            await self._checked_exec(f": > {q}", f"{what}: create empty")
-            return
-        for offset in range(0, len(b64), self._B64_CHUNK):
-            chunk = b64[offset:offset + self._B64_CHUNK]
-            redir = ">" if offset == 0 else ">>"
-            await self._checked_exec(
-                f"printf %s {shlex.quote(chunk)} {redir} {q}",
-                f"{what}: chunk @{offset}")
+    # (which has no clean half-close for tar's EOF). Uploads (env dir, tests)
+    # are small; downloads stream a base64'd tar out via stdout.
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         b64 = base64.b64encode(Path(source_path).read_bytes()).decode()
         parent = shlex.quote(str(Path(target_path).parent))
-        tmp = f"{target_path}.aeh-b64.tmp"
-        qt, qtmp = shlex.quote(target_path), shlex.quote(tmp)
-        await self._checked_exec(f"mkdir -p {parent}", f"upload_file mkdir -> {target_path}")
-        await self._write_b64_chunked(b64, tmp, f"upload_file -> {target_path}")
-        await self._checked_exec(
-            f"base64 -d {qtmp} > {qt} && rm -f {qtmp}",
-            f"upload_file decode -> {target_path}")
+        cmd = (f"mkdir -p {parent} && printf %s {shlex.quote(b64)} | base64 -d "
+               f"> {shlex.quote(target_path)}")
+        await self._checked_exec(cmd, f"upload_file -> {target_path}")
+
+    _UPLOAD_CHUNK = 65_000  # ~65 KB per exec call (under Linux MAX_ARG_STRLEN)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         def _reset_perms(info):
@@ -597,22 +585,31 @@ class KubernetesEnvironment(BaseEnvironment):
             info.mode = 0o755 if info.isdir() else 0o644
             return info
 
-        # gzip the tar — agent-log dirs are text and compress ~5-10x, which keeps
-        # the chunk count (and thus exec count) low.
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        with tarfile.open(fileobj=buf, mode="w") as tf:
             for item in sorted(Path(source_dir).iterdir()):
                 tf.add(item, arcname=item.name, filter=_reset_perms)
         b64 = base64.b64encode(buf.getvalue()).decode()
         tgt = shlex.quote(target_dir)
-        tmp = "/tmp/aeh-upload-dir.b64"
-        qtmp = shlex.quote(tmp)
-        await self._checked_exec(f"mkdir -p {tgt}", f"upload_dir mkdir -> {target_dir}")
-        await self._write_b64_chunked(b64, tmp, f"upload_dir -> {target_dir}")
-        await self._checked_exec(
-            f"base64 -d {qtmp} | tar xzmf - --no-same-owner --no-same-permissions "
-            f"-C {tgt} 2>/dev/null; rm -f {qtmp}; true",
-            f"upload_dir extract -> {target_dir}")
+
+        if len(b64) <= self._UPLOAD_CHUNK:
+            cmd = (f"mkdir -p {tgt} && printf %s {shlex.quote(b64)} | base64 -d "
+                   f"| tar xmf - --no-same-owner --no-same-permissions -C {tgt} 2>/dev/null; "
+                   f"true")
+            await self._checked_exec(cmd, f"upload_dir -> {target_dir}")
+        else:
+            staging = "/tmp/_aeh_upload.b64"
+            await self._checked_exec(
+                f"mkdir -p {tgt} && : > {staging}", f"upload_dir prep {target_dir}")
+            for i in range(0, len(b64), self._UPLOAD_CHUNK):
+                chunk = b64[i:i + self._UPLOAD_CHUNK]
+                await self._checked_exec(
+                    f"printf %s {shlex.quote(chunk)} >> {staging}",
+                    f"upload_dir chunk {i // self._UPLOAD_CHUNK}")
+            await self._checked_exec(
+                f"base64 -d {staging} | tar xmf - --no-same-owner "
+                f"--no-same-permissions -C {tgt} 2>/dev/null; rm -f {staging}; true",
+                f"upload_dir extract -> {target_dir}")
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         res = await self.exec(f"base64 -w0 {shlex.quote(source_path)}")
@@ -632,6 +629,6 @@ class KubernetesEnvironment(BaseEnvironment):
             tf.extractall(target_dir, filter="data")
 
     async def _checked_exec(self, command: str, what: str) -> None:
-        res = await self.exec(command, timeout_sec=300)
+        res = await self.exec(command, timeout_sec=600)
         if res.return_code != 0:
             raise RuntimeError(f"{what} failed (rc={res.return_code}): {res.stderr}")

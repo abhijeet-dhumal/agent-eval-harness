@@ -28,7 +28,7 @@ from typing import Optional
 
 import yaml
 
-from agent_eval.config import EvalConfig, _is_valid_eval_name, _validate_path_segment
+from agent_eval.config import EvalConfig, _is_valid_eval_name
 
 
 def _get_runs_dir(eval_name: str = ""):
@@ -52,131 +52,6 @@ def _resolve_under(root: Path, candidate: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Case record loading — reads all files, no schema interpretation
 # ---------------------------------------------------------------------------
-
-# Tool-name aliases across runners. Claude Code uses PascalCase (Read, Write,
-# Bash); other runners (opencode, codex, responses-api) often use snake_case
-# or different verbs. Matched case-insensitively so evidence extraction stays
-# useful when the runner isn't claude-code.
-_READ_TOOL_NAMES = {"read", "read_file", "readfile", "view", "cat", "open"}
-_WRITE_TOOL_NAMES = {"write", "write_file", "writefile", "create", "edit",
-                     "multiedit", "str_replace_editor", "update"}
-_EXEC_TOOL_NAMES = {"bash", "shell", "run", "execute", "exec", "command"}
-_SKILL_TOOL_NAMES = {"skill"}
-
-# Input-field aliases (again, runners disagree on the exact keys).
-_PATH_KEYS = ("file_path", "path", "file", "filename")
-_COMMAND_KEYS = ("command", "cmd", "script")
-_SKILL_KEYS = ("skill", "name", "id")
-
-
-def _first_key(mapping, keys):
-    """Return the first value present-and-truthy for the given key sequence."""
-    for k in keys:
-        v = mapping.get(k)
-        if v:
-            return v
-    return ""
-
-
-_REDIRECT_OPS_WITH_TARGET = {"<", ">", ">>", "2>", "2>>", "&>", ">&"}
-_SHELL_SEPARATORS = {"|", "||", "&&", ";", "&"}
-
-
-def _extract_scripts(command):
-    """Extract the script filenames executed by a shell command.
-
-    Filters out option flags (``-x``/``--flag``), ``key=value`` tokens
-    (values of ``--input=x.py``-style options), and shell redirect targets
-    (``> out.py``), so ``./run.sh --input=x.py > log.py`` records only
-    ``run.sh``. Uses ``shlex.split`` for correct quoting, falling back to
-    naive split on parse errors.
-    """
-    import shlex
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        tokens = command.split()
-    scripts = []
-    skip_next = False
-    for tok in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if not tok:
-            continue
-        if tok in _REDIRECT_OPS_WITH_TARGET:
-            skip_next = True
-            continue
-        if tok in _SHELL_SEPARATORS:
-            continue
-        if tok.startswith("-") or "=" in tok:
-            continue
-        if tok.endswith(".sh") or tok.endswith(".py"):
-            scripts.append(tok.rsplit("/", 1)[-1])
-    return scripts
-
-
-def _extract_verifiable_evidence(record):
-    """Summarize verifiable tool-call evidence from record["events"].
-
-    Consumes the already-parsed flat event schema built by
-    ``agent_eval.events.parse_stream_events`` (used for both events.json and
-    events.jsonl in ``load_case_record``), so this is runner-agnostic and
-    doesn't re-read any file from disk. Tool names and input keys are matched
-    against common aliases across runners (Claude Code, opencode, codex,
-    responses-api) — a genuinely different runner still gets accurate
-    per-tool counts and best-effort file/script extraction.
-    """
-    import collections
-    tools = collections.Counter()
-    skills_invoked = []
-    scripts_run = set()
-    files_read = set()
-    files_written = set()
-    total_turns = 0
-    cost_usd = 0.0
-
-    for event in record.get("events") or []:
-        if not isinstance(event, dict):
-            continue
-        etype = event.get("type")
-        if etype == "assistant":
-            for t in event.get("tools") or []:
-                if not isinstance(t, dict):
-                    continue
-                name = t.get("name") or ""
-                if not name:
-                    continue
-                tools[name] += 1
-                inp = t.get("input") or {}
-                name_l = name.lower()
-                if name_l in _SKILL_TOOL_NAMES:
-                    skills_invoked.append(_first_key(inp, _SKILL_KEYS) or "?")
-                elif name_l in _EXEC_TOOL_NAMES:
-                    cmd = _first_key(inp, _COMMAND_KEYS)
-                    scripts_run.update(_extract_scripts(cmd))
-                elif name_l in _READ_TOOL_NAMES:
-                    fp = _first_key(inp, _PATH_KEYS)
-                    if fp:
-                        files_read.add(fp.rsplit("/", 1)[-1])
-                elif name_l in _WRITE_TOOL_NAMES:
-                    fp = _first_key(inp, _PATH_KEYS)
-                    if fp:
-                        files_written.add(fp.rsplit("/", 1)[-1])
-        elif etype == "result":
-            total_turns = event.get("num_turns", 0) or 0
-            cost_usd = event.get("cost_usd", 0.0) or 0.0
-
-    return "\n".join([
-        f"Total turns: {total_turns}",
-        f"Cost: ${cost_usd:.2f}",
-        f"Tool calls: {dict(tools) if tools else 'none'}",
-        f"Skills invoked: {', '.join(skills_invoked) if skills_invoked else 'none'}",
-        f"Scripts executed: {', '.join(sorted(scripts_run)) if scripts_run else 'none'}",
-        f"Files read: {', '.join(sorted(files_read)) if files_read else 'none'}",
-        f"Files written: {', '.join(sorted(files_written)) if files_written else 'none'}",
-    ])
-
 
 def load_case_record(case_dir, config, run_id=None, runs_dir=None):
     """Load all outputs, execution metadata, and traces for a case.
@@ -254,15 +129,43 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None):
         artifact_dir = case_dir / output.path
         if not artifact_dir.exists():
             continue
+        key = Path(output.path).name or "main"
+        rel_files = sorted(
+            str(f.relative_to(case_dir))
+            for f in artifact_dir.rglob("*")
+            if f.is_file() and not f.is_symlink()
+        )
+        if rel_files:
+            record[f"{key}_files"] = rel_files
         for f in sorted(artifact_dir.iterdir()):
             if f.is_file() and not f.is_symlink():
-                key = Path(output.path).name or "main"
                 try:
                     record[f"{key}_content"] = f.read_text()
                     record[f"{key}_file"] = str(f)
                 except UnicodeDecodeError:
                     pass
                 break
+
+    # Harbor trials upload environment/input.yaml to workspace root as input.yaml
+    for candidate in ("environment/input.yaml", "input.yaml"):
+        input_path = case_dir / candidate
+        if input_path.is_file():
+            try:
+                record.setdefault("files", {})[candidate] = input_path.read_text()
+                record["input_yaml"] = record["files"][candidate]
+            except OSError:
+                pass
+            break
+
+    # Harbor task instruction (the exact prompt the agent was given)
+    instruction_path = case_dir / "instruction.md"
+    if instruction_path.is_file():
+        try:
+            record["instruction"] = instruction_path.read_text()
+        except OSError:
+            pass
+
+    _load_reference_file(case_dir, case_id, config, record)
 
     # --- Modified files (in-place edits collected by collect.py) ---
     _SKIP_MODIFIED_PREFIXES = {".work", "subagents", "hooks"}
@@ -308,65 +211,23 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None):
                 pass
 
     # --- Events (structured event stream) ---
-    # Support both events.json (JSON array) and events.jsonl (one JSON per line,
-    # as produced by Claude Code session transcripts in Harbor pods).
     events_path = case_dir / "events.json"
-    if not events_path.exists():
-        events_path = case_dir / "events.jsonl"
-    # Batch layout: events live at the run root, not per-case
     if not events_path.exists() and run_id and runs_dir:
-        candidate = runs_dir / run_id / "events.json"
-        if not candidate.exists():
-            candidate = runs_dir / run_id / "events.jsonl"
-        if candidate.exists():
-            events_path = candidate
+        events_path = runs_dir / run_id / "events.json"
     if events_path.exists():
         try:
-            raw_text = events_path.read_text(encoding="utf-8", errors="replace")
-            if events_path.suffix == ".jsonl":
-                # events.jsonl is RAW stream-json (Claude Code session
-                # transcripts in Harbor pods) — normalize it into the FLAT
-                # schema (event["text"], event["tools"], parent_tool_use_id)
-                # that extract_conversation_text and
-                # _extract_tool_calls_from_events consume. Reuse the same
-                # canonical parser collect.py uses to build events.json.
-                from agent_eval.events import parse_stream_events
-                record["events"] = parse_stream_events(raw_text)
-            else:
-                record["events"] = json.loads(raw_text)
+            with open(events_path) as f:
+                record["events"] = json.load(f)
             if not isinstance(record["events"], list):
-                print(f"  Warning: events file is not a list in {events_path}",
+                print(f"  Warning: events.json is not a list in {events_path}",
                       file=sys.stderr)
                 record["events"] = []
         except (json.JSONDecodeError, OSError) as e:
-            print(f"  Warning: malformed events file in {events_path}: {e}",
+            print(f"  Warning: malformed events.json in {events_path}: {e}",
                   file=sys.stderr)
             record["events"] = []
     else:
         record["events"] = []
-
-    # --- Case inputs (from input.yaml in case directory or dataset) ---
-    # Exposed as {{ inputs }} in LLM judge prompts (plural for symmetry with
-    # {{ outputs }} and the eval.yaml `inputs.tools` section).
-    record["inputs"] = ""
-    input_yaml = case_dir / "input.yaml"
-    if not input_yaml.exists() and config.dataset.path:
-        dataset_root = config.resolve_path(config.dataset.path).resolve()
-        input_yaml = dataset_root / case_id / "input.yaml"
-    if input_yaml.exists():
-        try:
-            raw = yaml.safe_load(input_yaml.read_text(encoding="utf-8", errors="replace")) or {}
-            if isinstance(raw, dict):
-                parts = []
-                for key, val in raw.items():
-                    if isinstance(val, (dict, list)):
-                        val = yaml.safe_dump(val, default_flow_style=False).rstrip()
-                    parts.append(f"**{key}**: {val}")
-                record["inputs"] = "\n\n".join(parts)
-            else:
-                record["inputs"] = str(raw)
-        except (yaml.YAMLError, OSError):
-            pass
 
     # --- Conversation text (convenience key for check judges) ---
     if record["events"]:
@@ -374,24 +235,6 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None):
         record["conversation"] = extract_conversation_text(record["events"])
     else:
         record["conversation"] = ""
-
-    # Fallback: build conversation from stdout.log only when no events exist
-    # (Harbor pods write agent output to stdout.log, not events.json).
-    # Gate on events being empty, not the conversation string, to avoid
-    # dumping raw stream-json into the prompt when events parsed but
-    # extract_conversation_text returned "".
-    if not record["events"]:
-        stdout_path = case_dir / "stdout.log"
-        if not stdout_path.exists() and run_id and runs_dir:
-            candidate = runs_dir / run_id / "stdout.log"
-            if candidate.exists():
-                stdout_path = candidate
-        if stdout_path.exists():
-            try:
-                record["conversation"] = stdout_path.read_text(
-                    encoding="utf-8", errors="replace")
-            except OSError:
-                pass
 
     # --- Logs (if traces config enables them) ---
     if run_id:
@@ -445,6 +288,8 @@ def load_case_record(case_dir, config, run_id=None, runs_dir=None):
         except (yaml.YAMLError, OSError):
             record["hook_outputs"] = {}
 
+    record["evidence"] = _build_evidence_text(record)
+
     return record
 
 
@@ -473,7 +318,34 @@ def _extract_tool_calls(stdout_text, tool_outputs):
     """Extract tool calls from raw stream-json stdout (fallback when no events)."""
     tool_patterns = [o.tool for o in tool_outputs]
     calls = []
-    for line in stdout_text.splitlines():
+    for call in _extract_all_tool_calls_from_stdout(stdout_text):
+        name = call.get("name", "")
+        for pattern in tool_patterns:
+            if pattern in name or name == pattern:
+                calls.append(call)
+                break
+    return calls
+
+
+def _extract_all_tool_calls_from_events(events):
+    """Extract every tool call from structured events (unfiltered)."""
+    calls = []
+    for event in events or []:
+        if event.get("type") != "assistant":
+            continue
+        if event.get("parent_tool_use_id"):
+            continue
+        for tool in event.get("tools") or []:
+            name = tool.get("name") or ""
+            if name:
+                calls.append({"name": name, "input": tool.get("input") or {}})
+    return calls
+
+
+def _extract_all_tool_calls_from_stdout(stdout_text):
+    """Extract every tool_use block from stream-json stdout (unfiltered)."""
+    calls = []
+    for line in (stdout_text or "").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -490,14 +362,88 @@ def _extract_tool_calls(stdout_text, tool_outputs):
             if block.get("type") != "tool_use":
                 continue
             name = block.get("name", "")
-            for pattern in tool_patterns:
-                if pattern in name or name == pattern:
-                    calls.append({
-                        "name": name,
-                        "input": block.get("input", {}),
-                    })
-                    break
+            if name:
+                calls.append({"name": name, "input": block.get("input") or {}})
     return calls
+
+
+def _format_tool_call_evidence(tool_calls):
+    """Human-readable tool trace for judge prompts."""
+    if not tool_calls:
+        return "(no tool calls detected in trace)"
+    lines = []
+    for i, call in enumerate(tool_calls, 1):
+        name = call.get("name", "?")
+        inp = call.get("input") or {}
+        detail = ""
+        if isinstance(inp, dict):
+            if "path" in inp or "file_path" in inp:
+                p = inp.get("path") or inp.get("file_path")
+                detail = f"path={p!r}"
+            elif "command" in inp:
+                cmd = str(inp["command"])
+                detail = f"command={cmd[:120]!r}"
+                if len(cmd) > 120:
+                    detail += "..."
+            elif "skill" in inp:
+                detail = f"skill={inp['skill']!r}"
+            else:
+                detail = json.dumps(inp, default=str)[:200]
+        lines.append(f"{i}. {name}({detail})")
+    return "\n".join(lines)
+
+
+def _build_evidence_text(record):
+    """Build verifiable tool-call evidence for LLM judge prompts."""
+    events = record.get("events") or []
+    calls = _extract_all_tool_calls_from_events(events)
+    if not calls:
+        stdout = record.get("stdout") or ""
+        if stdout:
+            calls = _extract_all_tool_calls_from_stdout(stdout)
+    if not calls:
+        calls = record.get("tool_calls") or []
+    parts = []
+    if record.get("num_turns"):
+        parts.append(f"Turns: {record['num_turns']}")
+    exit_code = record.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"Exit code: {exit_code}")
+    parts.append(_format_tool_call_evidence(calls))
+    return "\n".join(parts)
+
+
+def _load_reference_file(case_dir, case_id, config, record):
+    """Load gold reference RFE for pairwise comparison judges."""
+    candidates = []
+    if config.dataset.path:
+        try:
+            dataset_root = config.resolve_path(config.dataset.path).resolve()
+            candidates.extend([
+                dataset_root / case_id / "reference_rfe.md",
+                dataset_root / case_id / "reference-rfe.md",
+            ])
+        except (OSError, ValueError):
+            pass
+    case_dir = Path(case_dir)
+    candidates.extend([
+        case_dir / "environment" / "reference_rfe.md",
+        case_dir / "reference_rfe.md",
+        case_dir / "reference-rfe.md",
+    ])
+    # Harbor uploads environment/ files to workspace root
+    ref_in_files = (record.get("files") or {}).get("reference_rfe.md")
+    if isinstance(ref_in_files, str) and ref_in_files.strip():
+        record["reference_file"] = ref_in_files
+        return
+    for path in candidates:
+        try:
+            if path.is_file() and not path.is_symlink():
+                record["reference_file"] = path.read_text()
+                return
+        except (UnicodeDecodeError, OSError):
+            continue
+    record["reference_file"] = ""
 
 
 # ---------------------------------------------------------------------------
@@ -552,12 +498,17 @@ def _render_jinja2_template(template_text, arguments, outputs):
     - {{ annotations_text }} - formatted annotation text for display
     - {{ conversation }} - root-level assistant text from events
     - {{ tool_trace }} - chronological trace of tool calls (Read, Bash, etc.)
+    - {{ evidence }} - formatted tool-call trace (lazy, derived from events)
+    - {{ input }} - case input data (input.yaml contents)
+    - {{ reference_file }} - gold reference RFE (pairwise judges)
+    - {{ instruction }} - task instruction text
     """
     from jinja2 import Environment
     env = Environment()
     env.filters["tojson"] = lambda v: json.dumps(v, indent=2, default=str)
 
-    out = _OutputsProxy(outputs or {})
+    raw = outputs or {}
+    out = _OutputsProxy(raw)
 
     # Pre-render annotations as formatted text for {{ annotations }}
     ann_data = out.get("annotations", {})
@@ -588,15 +539,19 @@ def _render_jinja2_template(template_text, arguments, outputs):
         from agent_eval.events import extract_tool_trace
         tool_trace = extract_tool_trace(out["events"])
 
+    # Additional template vars for Harbor/GRPO eval judges
+    input_text = ""
+    input_yaml = out.get("input_yaml")
+    if input_yaml:
+        input_text = input_yaml
+    elif out.get("files"):
+        input_text = out["files"].get("input.yaml", "")
+
+    instruction_text = out.get("instruction", "")
+    evidence_text = raw.get("evidence") or _build_evidence_text(raw)
+    reference_file = raw.get("reference_file", "")
+
     template = env.from_string(template_text)
-
-    # Lazy evidence: only derive it if the template references {{ evidence }}.
-    # Cache in out["evidence"] so multiple judges/samples reuse the same result.
-    evidence_text = out.get("evidence", "")
-    if not evidence_text and "{{ evidence" in template_text:
-        evidence_text = _extract_verifiable_evidence(out)
-        out["evidence"] = evidence_text
-
     return template.render(
         arguments=arguments or {},
         outputs=out,
@@ -604,8 +559,11 @@ def _render_jinja2_template(template_text, arguments, outputs):
         annotations_text=ann_text,  # Formatted text for display
         conversation=conversation,
         inputs=inputs_text,
+        input=input_text,
+        instruction=instruction_text,
         evidence=evidence_text,
         tool_trace=tool_trace,
+        reference_file=reference_file,
     )
 
 
@@ -1007,13 +965,24 @@ def score_cases(judges, case_dirs, config, run_id=None, samples_override=None):
             if condition:
                 try:
                     annotations = record.get("annotations", {})
-                    if not eval(condition, {"__builtins__": {}},
+                    _safe_builtins = {
+                        "__builtins__": {
+                            "any": any, "all": all, "bool": bool, "str": str,
+                            "int": int, "float": float, "len": len, "list": list,
+                            "dict": dict, "set": set, "tuple": tuple, "isinstance": isinstance,
+                            "hasattr": hasattr, "getattr": getattr, "min": min, "max": max,
+                            "sum": sum, "sorted": sorted, "enumerate": enumerate,
+                            "True": True, "False": False, "None": None,
+                        }
+                    }
+                    if not eval(condition, _safe_builtins,
                                 {"annotations": annotations, "outputs": record}):
                         case_results[name] = {
                             "value": None,
                             "rationale": f"Skipped: condition '{condition}' is false",
                             "judge_type": judge_type,
                         }
+                        record[f"judge_{name}"] = case_results[name]
                         continue
                 except Exception as e:
                     case_results[name] = {
@@ -1021,6 +990,7 @@ def score_cases(judges, case_dirs, config, run_id=None, samples_override=None):
                         "rationale": f"Condition error: {e}",
                         "judge_type": judge_type,
                     }
+                    record[f"judge_{name}"] = case_results[name]
                     continue
             # CLI --samples overrides per-judge config for LLM judges only;
             # deterministic judges always run once.
@@ -1047,6 +1017,7 @@ def score_cases(judges, case_dirs, config, run_id=None, samples_override=None):
             except Exception as e:
                 case_results[name] = {"value": None, "error": str(e),
                                       "judge_type": judge_type}
+            record[f"judge_{name}"] = case_results[name]
         return case_id, case_results
 
     with ThreadPoolExecutor(max_workers=parallelism) as pool:
@@ -1435,15 +1406,24 @@ def _first_content(record):
 
 
 def _get_anthropic_client():
+    """Build an Anthropic client for LLM judge calls.
+
+    Uses EVAL_JUDGE_BASE_URL / EVAL_JUDGE_API_KEY when set, allowing the judge
+    to call a different endpoint than the agent (e.g. Claude Opus via LiteLLM
+    gateway while the agent uses a local vLLM policy model).
+    """
     project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
     region = os.environ.get("CLOUD_ML_REGION", "us-east5")
     if project_id:
         from anthropic import AnthropicVertex
         return AnthropicVertex(project_id=project_id, region=region)
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    api_key = (os.environ.get("EVAL_JUDGE_API_KEY")
+               or os.environ.get("ANTHROPIC_API_KEY")
+               or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
     if api_key:
         from anthropic import Anthropic
-        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        base_url = (os.environ.get("EVAL_JUDGE_BASE_URL")
+                    or os.environ.get("ANTHROPIC_BASE_URL"))
         return Anthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
     raise RuntimeError("Set ANTHROPIC_VERTEX_PROJECT_ID, ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN")
 
@@ -1957,12 +1937,6 @@ def main():
     reg_p.add_argument("--baseline", default=None)
 
     args = parser.parse_args()
-
-    # Validate run_id / baseline to prevent path traversal (CWE-22)
-    _validate_path_segment(args.run_id, "--run-id")
-    if getattr(args, "baseline", None) is not None:
-        _validate_path_segment(args.baseline, "--baseline")
-
     {"judges": cmd_judges, "pairwise": cmd_pairwise,
      "regression": cmd_regression}[args.command](args)
 

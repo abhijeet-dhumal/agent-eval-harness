@@ -30,131 +30,53 @@ except ImportError:
           file=sys.stderr)
     sys.exit(0)
 
-from agent_eval.config import EvalConfig, _validate_path_segment
+from agent_eval.config import EvalConfig
 from agent_eval.mlflow.experiment import resolve_tracking_uri
 
 
 # ── Trace builder (extracted to agent_eval/mlflow/trace_builder.py) ──
 from agent_eval.mlflow.trace_builder import build_trace, log_trace
-# Same transcript metric extractor the run-level aggregation uses, so per-step
-# trace cost/tokens match the run `cost_usd` metric and the HTML report.
-from agent_eval.harbor.results import _extract_transcript_metrics
+from agent_eval.mlflow.trajectory_trace import build_trace_from_trajectory
 
 
-def _is_within(path, root):
-    """True if ``path`` resolves to ``root`` or a descendant (symlinks resolved)."""
+def _log_eval_dataset_lineage(config, per_case: dict) -> None:
+    """Log eval case manifest as an MLflow dataset input."""
+    if not per_case:
+        return
     try:
-        path.resolve(strict=True).relative_to(root.resolve(strict=True))
-        return True
-    except (OSError, ValueError):
-        return False
+        import pandas as pd
+        import mlflow.data
+
+        rows = [{"case_id": case_id} for case_id in sorted(per_case)]
+        dataset_path = config.dataset.path if config.dataset else "eval-cases"
+        ds = mlflow.data.from_pandas(
+            pd.DataFrame(rows),
+            source=str(dataset_path),
+            name=f"{config.name}-eval-cases",
+        )
+        mlflow.log_input(ds, context="evaluation")
+    except Exception as exc:
+        print(f"WARNING: failed to log eval dataset lineage: {exc}", file=sys.stderr)
 
 
-def _resolve_harbor_job_dir(raw, run_dir):
-    """Resolve harbor_job_dir (stored repo-root-relative) to an existing dir.
-
-    The job dir is local harness output, but we still reject absolute paths,
-    ``..`` traversal, and symlinks, and require the resolved directory to live
-    under one of run_dir's ancestors — so a tampered run_result.json can't point
-    trace collection at files outside the expected tree (CWE-22/CWE-59).
-    """
-    if not raw:
+def _resolve_external_model_id(parent_run_id: str, run_result: dict, run_id: str) -> str | None:
+    """Register a lightweight external model reference on the training run."""
+    base_model = run_result.get("model")
+    if not base_model:
         return None
-    p = Path(raw)
-    if p.is_absolute() or ".." in p.parts:
+    try:
+        params = {"base_model": str(base_model)}
+        if run_result.get("ray_job_id"):
+            params["ray_job_id"] = str(run_result["ray_job_id"])
+        model_info = mlflow.create_external_model(
+            name=f"grpo-{run_id[:48]}",
+            source_run_id=parent_run_id,
+            params=params,
+        )
+        return model_info.model_id
+    except Exception as exc:
+        print(f"WARNING: failed to create external model reference: {exc}", file=sys.stderr)
         return None
-    for root in run_dir.resolve().parents:
-        candidate = root / p
-        if (candidate.is_dir() and not candidate.is_symlink()
-                and _is_within(candidate, root)):
-            return candidate
-    return None
-
-
-def _harbor_steps(job_dir):
-    """Yield (case_id, case_dir, step_name, transcript_path, subagent_dir) per step.
-
-    Harbor writes each step's Claude stream-json to
-    ``<case>__<hash>/steps/<step>/agent/claude-code.txt`` (multi-step) or
-    ``<case>__<hash>/agent/claude-code.txt`` (single-step). Background subagent
-    transcripts live under ``.../agent/sessions/projects/*/*/subagents/``.
-    The case_id (name before ``__``) matches the summary.yaml per_case keys.
-    """
-    job_root = job_dir.resolve(strict=True)
-    for case_dir in sorted(d for d in job_dir.iterdir()
-                           if d.is_dir() and not d.is_symlink()
-                           and "__" in d.name and _is_within(d, job_root)):
-        case_id = case_dir.name.split("__")[0]
-        steps_dir = case_dir / "steps"
-        if steps_dir.is_dir():
-            step_dirs = sorted(steps_dir.iterdir(), key=lambda p: p.stat().st_mtime)
-        elif (case_dir / "agent" / "claude-code.txt").exists():
-            step_dirs = [case_dir]  # single-step layout
-        else:
-            step_dirs = []
-        for sd in step_dirs:
-            agent_dir = sd / "agent"
-            transcript = agent_dir / "claude-code.txt"
-            if not (transcript.is_file() and not transcript.is_symlink()
-                    and _is_within(transcript, job_root)):
-                continue
-            step_name = "" if sd is case_dir else sd.name
-            subs = [p for p in agent_dir.glob("sessions/projects/*/*/subagents")
-                    if p.is_dir() and not p.is_symlink()
-                    and _is_within(p, job_root)]
-            yield (case_id, case_dir, step_name, transcript,
-                   subs[0] if len(subs) == 1 else None)
-
-
-def _harbor_step_run_result(case_dir, step_name, base, transcript):
-    """Per-step run_result for trace annotation: model, exit code, cost, tokens.
-
-    Cost and tokens are read from the step transcript with the SAME extractor
-    the run-level aggregation uses (_extract_transcript_metrics -> the result
-    event's total_cost_usd / usage), so the trace cost matches the run
-    `cost_usd` metric and the HTML report. Crucially total_cost_usd includes
-    background subagent cost (e.g. the auto-fix step's subagents), which
-    result.json's agent_result.cost_usd omits — so this is the accurate total.
-    result.json is still consulted for the step's exit code. Token usage already
-    arrives in the {input, output, cache_read, cache_create} schema build_trace
-    expects, so no remapping is needed.
-    """
-    rr = {"model": base.get("model", ""), "exit_code": 0}
-
-    metrics = _extract_transcript_metrics(transcript)
-    cost = metrics.get("cost_usd")
-    if cost:
-        rr["cost_usd"] = cost
-    tu = metrics.get("token_usage") or {}
-    token_usage = {k: (tu.get(k) or 0)
-                   for k in ("input", "output", "cache_read", "cache_create")}
-    if any(token_usage.values()):
-        rr["token_usage"] = token_usage
-        # per_model_usage drives the per-span mlflow.llm.cost distribution that
-        # the Cost Breakdown / Cost Over Time charts aggregate.
-        if cost and rr["model"]:
-            rr["per_model_usage"] = {
-                rr["model"]: {**token_usage, "cost_usd": cost},
-            }
-
-    # exit_code comes from the step's exception_info in result.json (best-effort).
-    result_path = case_dir / "result.json"
-    if result_path.is_file():
-        try:
-            data = json.loads(result_path.read_text())
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-            print(f"WARNING: failed to parse Harbor result {result_path}: {e}",
-                  file=sys.stderr)
-            data = None
-        if data:
-            steps = data.get("step_results") or []
-            match = next((s for s in steps
-                          if s.get("step_name") == step_name), None)
-            if match is None and not step_name:
-                match = data  # single-step trial
-            if match and match.get("exception_info"):
-                rr["exit_code"] = 1
-    return rr
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -164,10 +86,17 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--parent-run-id",
+        default=None,
+        help="NeMo RL training run id; eval results log to a nested child run",
+    )
+    parser.add_argument(
+        "--lineage-ray-job-id",
+        default=None,
+        help="Ray job id tag for lineage (grpo-gate-YYYYMMDD-HHMMSS)",
+    )
     args = parser.parse_args()
-
-    # Validate run_id to prevent path traversal (CWE-22)
-    args.run_id = _validate_path_segment(args.run_id, "--run-id")
 
     config = EvalConfig.from_yaml(args.config)
     mlflow.set_tracking_uri(resolve_tracking_uri(config))
@@ -200,8 +129,29 @@ def main():
     exp = mlflow.get_experiment_by_name(experiment_name)
     experiment_id = exp.experiment_id if exp else "0"
 
-    with mlflow.start_run(run_name=args.run_id) as run:
+    external_model_id = None
+    if args.parent_run_id:
+        external_model_id = _resolve_external_model_id(
+            args.parent_run_id, run_result, args.run_id
+        )
+
+    run_kwargs: dict = {"run_name": args.run_id}
+    if args.parent_run_id:
+        run_kwargs["run_name"] = f"eval-{args.run_id}"
+        run_kwargs["tags"] = {"mlflow.parentRunId": args.parent_run_id}
+
+    with mlflow.start_run(**run_kwargs) as run:
         mlflow_run_id = run.info.run_id
+
+        mlflow.set_tag("source", "agent-eval-harness")
+        if args.parent_run_id:
+            mlflow.set_tag("lineage_mode", "child_of_training_run")
+            mlflow.set_tag("training_run_id", args.parent_run_id)
+            mlflow.set_tag("harness_run_id", args.run_id)
+            if external_model_id:
+                mlflow.set_tag("mlflow.model.id", external_model_id)
+        if args.lineage_ray_job_id:
+            mlflow.set_tag("ray_job_id", args.lineage_ray_job_id)
 
         # ── Params ───────────────────────────────────────────────
         params = {
@@ -299,9 +249,25 @@ def main():
                 inp = case_dir / "input.yaml"
                 if inp.exists():
                     mlflow.log_artifact(str(inp), f"inputs/{case_dir.name}")
+                traj = case_dir / "trajectory.json"
+                if traj.exists():
+                    mlflow.log_artifact(str(traj), f"cases/{case_dir.name}")
+                case_artifacts = case_dir / "artifacts"
+                if case_artifacts.is_dir():
+                    mlflow.log_artifacts(
+                        str(case_artifacts), f"cases/{case_dir.name}/artifacts"
+                    )
+                for verifier_name in ("reward.json", "judges.json", "reward.txt"):
+                    verifier_path = case_dir / "verifier" / verifier_name
+                    if verifier_path.exists():
+                        mlflow.log_artifact(
+                            str(verifier_path),
+                            f"cases/{case_dir.name}/verifier",
+                        )
 
         # ── Per-case results table ───────────────────────────────
         per_case = summary.get("per_case", {})
+        _log_eval_dataset_lineage(config, per_case)
         if per_case:
             table_rows = []
             for case_id, case_results in per_case.items():
@@ -329,7 +295,6 @@ def main():
     # because they already exist in the DB (no async queue issues).
     main_trace_id = None
     case_trace_map = {}  # case_id -> trace_id
-    harbor_step_traces = {}  # case_id -> {step_name: trace_id} (harbor per-step)
     trace_ids = []
 
     # TODO: paginate via page_token for experiments with >500 unlinked traces
@@ -351,21 +316,36 @@ def main():
     # Build synthetic traces from stdout.log for cases not already covered
     # by existing execution traces.
     exec_mode = run_result.get("execution_mode", "batch")
-    if exec_mode in ("case", "prompt"):
+    if exec_mode in ("case", "prompt", "harbor-grpo"):
         cases_dir = run_dir / "cases"
         if cases_dir.exists():
             for case_dir in sorted(d for d in cases_dir.iterdir() if d.is_dir()):
-                case_stdout = case_dir / "stdout.log"
-                if not case_stdout.exists():
-                    continue
                 case_id = case_dir.name
                 if case_id in case_trace_map:
                     continue
                 case_result = run_result.get("per_case", {}).get(case_id, run_result)
                 _skill = config.resolve_skill()
                 trace_name = f"{_skill} ({case_id})" if _skill else case_id
-                trace_dict = build_trace(case_stdout, case_result, case_id,
-                                         experiment_id, trace_name=trace_name)
+                trace_dict = None
+                case_stdout = case_dir / "stdout.log"
+                if case_stdout.exists():
+                    trace_dict = build_trace(
+                        case_stdout, case_result, case_id, experiment_id, trace_name=trace_name
+                    )
+                else:
+                    for trajectory_path in (
+                        case_dir / "trajectory.json",
+                        case_dir / "agent" / "trajectory.json",
+                    ):
+                        if trajectory_path.exists():
+                            trace_dict = build_trace_from_trajectory(
+                                trajectory_path,
+                                case_result,
+                                case_id,
+                                experiment_id,
+                                trace_name=trace_name,
+                            )
+                            break
                 if trace_dict:
                     tid = log_trace(trace_dict)
                     if tid:
@@ -373,37 +353,6 @@ def main():
                         trace_ids.append(tid)
                         num_spans = len(trace_dict["data"]["spans"])
                         print(f"TRACE: {tid} ({num_spans} spans) — {case_id}")
-    elif exec_mode == "harbor":
-        # Harbor runs in-pod and writes no cases/<id>/stdout.log; the Claude
-        # stream-json lives per step in the harbor job dir. Build one trace per
-        # step (same build_trace path as local runs), nesting background
-        # subagents from the step session's subagents/ dir.
-        job_dir = _resolve_harbor_job_dir(run_result.get("harbor_job_dir"), run_dir)
-        if job_dir is None:
-            print("WARNING: harbor_job_dir not found; skipping trace build",
-                  file=sys.stderr)
-        else:
-            for case_id, case_dir, step_name, transcript, sub_dir in \
-                    _harbor_steps(job_dir):
-                step_key = f"{case_id}/{step_name}" if step_name else case_id
-                if step_key in case_trace_map:
-                    continue
-                step_rr = _harbor_step_run_result(case_dir, step_name,
-                                                  run_result, transcript)
-                trace_name = (f"{config.skill} ({step_key})"
-                              if config.skill else step_key)
-                trace_dict = build_trace(transcript, step_rr, step_key,
-                                         experiment_id, trace_name=trace_name,
-                                         subagent_dir=sub_dir)
-                if trace_dict:
-                    tid = log_trace(trace_dict)
-                    if tid:
-                        case_trace_map[step_key] = tid
-                        harbor_step_traces.setdefault(case_id, {})[step_name] = tid
-                        trace_ids.append(tid)
-                        num_spans = len(trace_dict["data"]["spans"])
-                        print(f"TRACE: {tid} ({num_spans} spans) — {step_key}"
-                              + (" +subagents" if sub_dir else ""))
     else:
         stdout_path = run_dir / "stdout.log"
         if stdout_path.exists() and run_result:
@@ -464,9 +413,9 @@ def main():
         return None
 
     for case_id, case_results in per_case.items():
-        if not isinstance(case_results, dict):
+        trace_id = case_trace_map.get(case_id, main_trace_id)
+        if not trace_id or not isinstance(case_results, dict):
             continue
-        steps_for_case = harbor_step_traces.get(case_id)
         for judge_name, result in case_results.items():
             if not isinstance(result, dict):
                 continue
@@ -475,19 +424,6 @@ def main():
                 continue
             fb_value = _to_feedback_value(value)
             if fb_value is None:
-                continue
-            # Route feedback: for harbor per-step traces, a step judge
-            # (create/auto-fix/submit) attaches to its own step trace and any
-            # overall judge to the final step; non-harbor runs use the
-            # per-case trace.
-            if steps_for_case:
-                step_trace_ids = list(steps_for_case.values())
-                trace_id = (steps_for_case.get(judge_name)
-                            or steps_for_case.get("submit")
-                            or (step_trace_ids[-1] if step_trace_ids else None))
-            else:
-                trace_id = case_trace_map.get(case_id, main_trace_id)
-            if not trace_id:
                 continue
             try:
                 mlflow.log_feedback(
@@ -507,6 +443,10 @@ def main():
 
     print(f"EXPERIMENT: {experiment_name}")
     print(f"RUN: {mlflow_run_id}")
+    if args.parent_run_id:
+        print(f"PARENT: {args.parent_run_id}")
+    if external_model_id:
+        print(f"MODEL: {external_model_id}")
     print(f"PARAMS: {len(params)}")
     print(f"METRICS: {metric_count}")
     print(f"TABLE: per_case_results ({len(per_case)} cases)")

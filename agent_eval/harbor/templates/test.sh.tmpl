@@ -10,6 +10,19 @@ mkdir -p /logs/verifier
 # Harbor writes the agent's output under /logs/agent, not the workspace.
 cat /logs/agent/*.txt > "@@WORKDIR@@/stdout.log" 2>/dev/null || true
 
+# Surface agent trace summary to container logs (visible via kubectl logs)
+echo "=== AGENT TRACE SUMMARY ==="
+if [ -f /logs/agent/claude-code.txt ]; then
+  echo "Transcript size: $(wc -c < /logs/agent/claude-code.txt) bytes"
+  echo "Tool calls:"
+  grep -oP '"type":"tool_use".*?"name":"[^"]*"' /logs/agent/claude-code.txt 2>/dev/null | \
+    grep -oP '"name":"[^"]*"' | sort | uniq -c | sort -rn | head -15 || true
+  echo "---"
+  echo "Last 30 lines of agent output:"
+  tail -30 /logs/agent/claude-code.txt
+fi
+echo "=== END AGENT TRACE ==="
+
 python3 -m agent_eval.harbor.reward \
   --config /tests/eval.yaml \
   --case-dir "@@WORKDIR@@" \
@@ -18,7 +31,6 @@ rc=$?
 
 # Surface the produced artifacts to the host: Harbor downloads /logs/verifier,
 # so the run-mapper can render per-case Output files in the report.
-# Only copy the output paths declared in eval.yaml (not scratch files).
-@@COPY_OUTPUTS@@
+cp -r "@@WORKDIR@@/artifacts" /logs/verifier/artifacts 2>/dev/null || true
 
 exit $rc

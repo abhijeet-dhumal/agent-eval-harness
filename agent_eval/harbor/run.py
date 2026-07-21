@@ -12,7 +12,6 @@ so this step does not re-run judges; it aggregates their results. Pairwise stays
 a suite-level step on top (run separately over two run dirs).
 """
 
-import agent_eval._bootstrap  # noqa: F401 — auto-activate venv before 3p imports
 import argparse
 import importlib.util
 import json
@@ -64,12 +63,7 @@ _RUNNER_TO_HARBOR_AGENT = {
     "responses-api": None,  # no Harbor equivalent
 }
 _DEFAULT_AGENT = "claude-code"
-_ENV_IMPORT_PATHS = {
-    "podman": "agent_eval.harbor.podman:PodmanEnvironment",
-    "kubernetes": "agent_eval.harbor.kubernetes:KubernetesEnvironment",
-    "k8s": "agent_eval.harbor.kubernetes:KubernetesEnvironment",
-    "openshift": "agent_eval.harbor.kubernetes:KubernetesEnvironment",
-}
+_DEFAULT_ENV_IMPORT = "agent_eval.harbor.podman:PodmanEnvironment"
 
 
 def _judge_types(config: EvalConfig) -> dict:
@@ -111,7 +105,7 @@ def build_summary(parsed_job: dict, config: EvalConfig) -> dict:
             case_judges[name] = {
                 "value": value,
                 "rationale": rec.get("rationale", "") or rec.get("error", ""),
-                "judge_type": types.get(name) or rec.get("judge_type", "check"),
+                "judge_type": types.get(name, "check"),
             }
             if value is not None:
                 agg_values.setdefault(name, []).append(value)
@@ -157,18 +151,7 @@ def _copy_case_artifacts(parsed: dict, output_dir: Path) -> None:
     """
     import shutil
     for trial in parsed["trials"]:
-        trial_path = Path(trial.get("trial_path", ""))
-        src = trial_path / "verifier" / "artifacts"
-
-        # Multi-step: check each step's artifacts (last non-empty one wins)
-        if not src.is_dir():
-            steps_dir = trial_path / "steps"
-            if steps_dir.is_dir():
-                for step_dir in sorted(steps_dir.iterdir()):
-                    candidate = step_dir / "verifier" / "artifacts"
-                    if candidate.is_dir() and any(candidate.iterdir()):
-                        src = candidate
-
+        src = Path(trial.get("trial_path", "")) / "verifier" / "artifacts"
         if not src.is_dir():
             continue
         dst = output_dir / "cases" / trial["case_id"] / "artifacts"
@@ -214,7 +197,7 @@ def run_eval_on_harbor(
     n_concurrent: int = 1,
     workdir: str = "/workspace",
     agent_name: str | None = None,
-    env_import_path: str | None = None,
+    env_import_path: str | None = _DEFAULT_ENV_IMPORT,
     harbor_bin: str = "harbor",
     regenerate: bool = False,
 ) -> int:
@@ -264,18 +247,15 @@ def run_eval_on_harbor(
     ]
     if env_import_path:
         cmd += ["--environment-import-path", env_import_path]
+    # Harbor's Rich TUI exits immediately when stdout is not a TTY.
+    # --quiet disables the live display and keeps harbor running in all contexts.
+    if "--quiet" not in cmd and "-q" not in cmd:
+        cmd.insert(cmd.index("run") + 1, "--quiet")
     print(f"harbor: {' '.join(cmd)}", file=sys.stderr)
-    import signal
-    proc = subprocess.Popen(cmd)
-    def _forward_signal(signum, frame):
-        proc.send_signal(signum)
-    prev_term = signal.signal(signal.SIGTERM, _forward_signal)
-    prev_int = signal.signal(signal.SIGINT, _forward_signal)
-    try:
-        proc.wait()
-    finally:
-        signal.signal(signal.SIGTERM, prev_term)
-        signal.signal(signal.SIGINT, prev_int)
+    # Use shell=True so harbor inherits a proper shell environment (same as
+    # invoking from a terminal). Direct subprocess.run without shell exits early
+    # when Python's stdout is not a TTY, even with --quiet.
+    proc = subprocess.run(" ".join(cmd), shell=True, stdin=subprocess.DEVNULL)
     if proc.returncode != 0:
         print(f"harbor run exited {proc.returncode}", file=sys.stderr)
         return proc.returncode
@@ -296,19 +276,12 @@ def run_eval_on_harbor(
         "exit_code": 0 if parsed["n_errored"] == 0 else 1,
         "execution_mode": "harbor",
         "agent": f"harbor:{agent_name}",
-        "agent_version": parsed.get("agent_version"),
         "model": model,
         "num_cases": parsed["n_completed"],
-        "num_turns": parsed.get("num_turns"),
-        "duration_s": parsed.get("duration_s"),
         "mean_reward": parsed["mean_reward"],
         "cost_usd": parsed.get("cost_usd"),
         "token_usage": parsed.get("token_usage"),
         "harbor_job_dir": parsed["job_dir"],
-        "n_infra_errors": parsed.get("n_infra_errors", 0),
-        "infra_errors": parsed.get("infra_errors", []),
-        "n_trial_errors": parsed.get("n_trial_errors", 0),
-        "trial_errors": parsed.get("trial_errors", []),
     }
     (output_dir / "run_result.json").write_text(json.dumps(run_meta, indent=2) + "\n")
     (output_dir / "summary.yaml").write_text(
@@ -318,23 +291,7 @@ def run_eval_on_harbor(
     # 4b. Generate the HTML report (same renderer as the local path).
     _write_report(config_path, output_dir, summary, run_meta)
 
-    # 5. Surface Harbor infra/trial errors first, so they appear even when the
-    # run also regresses (the regression check below early-returns).
-    infra = parsed.get("infra_errors", [])
-    if infra:
-        print(f"INFRA-ERRORS: {len(infra)} step(s) had no verifier reward "
-              f"(transient k8s exec; excluded from judge means, not scored 0):",
-              file=sys.stderr)
-        for case_id, step in infra:
-            print(f"  [{case_id}] {step}", file=sys.stderr)
-    trial_errs = parsed.get("trial_errors", [])
-    if trial_errs:
-        print(f"TRIAL-ERRORS: {len(trial_errs)} trial(s) failed before producing "
-              f"a reward (e.g. pod never Ready):", file=sys.stderr)
-        for case_id, reason in trial_errs:
-            print(f"  [{case_id}] {reason}", file=sys.stderr)
-
-    # 6. Regression detection (suite-level), mirroring score.py regression.
+    # 5. Regression detection (suite-level), mirroring score.py regression.
     score = _load_score_module()
     regressions = score.detect_regressions(summary["judges"], config.thresholds)
     if regressions:
@@ -344,8 +301,7 @@ def run_eval_on_harbor(
                   file=sys.stderr)
         return 1
     print(f"Mapped {parsed['n_completed']} case(s) → {output_dir}/summary.yaml "
-          f"(mean_reward={parsed['mean_reward']}); "
-          f"REGRESSIONS: 0; INFRA-ERRORS: {len(infra)}; TRIAL-ERRORS: {len(trial_errs)}")
+          f"(mean_reward={parsed['mean_reward']}); REGRESSIONS: 0")
     return 0
 
 
@@ -370,17 +326,13 @@ def main() -> None:
     p.add_argument("--agent", default=None,
                    help="Harbor agent name (default: from runner.type in eval.yaml; "
                         "e.g. claude-code, opencode)")
-    p.add_argument("--env", default="kubernetes",
-                   choices=["podman", "kubernetes", "k8s", "openshift"],
-                   help="Execution environment (default: kubernetes)")
-    p.add_argument("--environment-import-path", default=None,
-                   help="Custom Harbor environment import path (overrides --env)")
+    p.add_argument("--environment-import-path", default=_DEFAULT_ENV_IMPORT,
+                   help="Custom Harbor environment import path (default: Podman; "
+                        "omit to use Harbor's built-in docker env)")
     p.add_argument("--regenerate", action="store_true",
                    help="Regenerate task packages even if --tasks-dir already has them "
                         "(default: reuse pre-generated tasks, e.g. from /eval-dataset)")
     args = p.parse_args()
-
-    env_import = args.environment_import_path or _ENV_IMPORT_PATHS.get(args.env)
 
     code = run_eval_on_harbor(
         Path(args.config), image=args.image, model=args.model,
@@ -389,7 +341,7 @@ def main() -> None:
         judge_model=args.judge_model, cases=args.cases,
         n_concurrent=args.n_concurrent, workdir=args.workdir,
         agent_name=args.agent,
-        env_import_path=env_import,
+        env_import_path=args.environment_import_path,
         regenerate=args.regenerate,
     )
     sys.exit(code)

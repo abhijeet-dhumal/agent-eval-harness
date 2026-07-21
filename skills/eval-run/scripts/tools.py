@@ -94,6 +94,9 @@ def _find_handler(tool_name, tool_input, handlers):
         for pattern in patterns:
             if pattern == tool_name:
                 return h
+            # Lone "*" is a misconfigured catch-all (blocks every tool). Skip it.
+            if pattern == "*":
+                continue
             if pattern.endswith("*") and tool_name.startswith(pattern[:-1]):
                 return h
 

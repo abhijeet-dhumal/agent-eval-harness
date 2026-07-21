@@ -419,12 +419,6 @@ def _read_case_input(dataset_path: str, case_id: str) -> str:
     """Read the input file from a dataset case directory."""
     case_dir = Path(dataset_path) / case_id
     if not case_dir.exists():
-        ds = Path(dataset_path)
-        if ds.is_dir():
-            matches = [d for d in ds.iterdir() if d.is_dir() and d.name.startswith(case_id)]
-            if len(matches) == 1:
-                case_dir = matches[0]
-    if not case_dir.exists():
         return ""
     for suffix in (".yaml", ".yml", ".json"):
         candidate = case_dir / f"input{suffix}"
@@ -582,6 +576,21 @@ details.eval-params > .run-command { margin: 0.6em 0 0; }
 .delta-bad { color: var(--danger); }
 .delta-flat { color: var(--text-muted); font-weight: 500; }
 .baseline-row td { background: var(--surface-2); font-style: italic; color: var(--text-muted); }
+.matrix-wrap { overflow-x: auto; margin: 1em 0; }
+.score-matrix { font-size: 0.82em; border-collapse: separate; border-spacing: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.score-matrix th, .score-matrix td { padding: 5px 8px; text-align: center; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); white-space: nowrap; }
+.score-matrix th:last-child, .score-matrix td:last-child { border-right: none; }
+.score-matrix tr:last-child td { border-bottom: none; }
+.matrix-case-hdr { text-align: left !important; min-width: 200px; }
+.matrix-judge-hdr { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 0.85em; min-width: 32px; height: 80px; vertical-align: bottom; }
+.matrix-case-cell { text-align: left !important; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em; }
+.matrix-pass { background: var(--success-soft); color: var(--success); font-weight: 600; }
+.matrix-fail { background: var(--danger-soft); color: var(--danger); font-weight: 600; }
+.matrix-skip { background: var(--neutral-soft); color: var(--text-muted); }
+.matrix-high { background: color-mix(in srgb, var(--success-soft) 80%, transparent); color: var(--success); font-weight: 600; }
+.matrix-good { background: color-mix(in srgb, var(--success-soft) 50%, transparent); color: var(--text); }
+.matrix-mid { background: color-mix(in srgb, var(--warning-soft) 60%, transparent); color: var(--text); }
+.matrix-low { background: color-mix(in srgb, var(--danger-soft) 40%, transparent); color: var(--text); }
 .rationale { font-size: 0.88em; color: var(--text-soft); }
 .rationale p { margin: 0 0 0.5em; line-height: 1.5; }
 .rationale p:last-child { margin-bottom: 0; }
@@ -1339,11 +1348,8 @@ def _render_scoring_summary(summary, config, baseline_summary=None):
                 status_cls = "pass" if ok else "fail"
                 status_label = "PASS" if ok else "FAIL"
 
-        jtype, jmodel = judge_info.get(judge_name, (None, "—"))
-        if jtype is None:
-            first_case = next(iter(summary.get("per_case", {}).values()), {})
-            jtype = (first_case.get(judge_name) or {}).get("judge_type", "—")
-        if jtype in ("check", "code", "builtin", "step") and jmodel == "—":
+        jtype, jmodel = judge_info.get(judge_name, ("—", "—"))
+        if jtype in ("check", "code", "builtin") and jmodel == "—":
             type_label = jtype
         else:
             type_label = f'{jtype} ({jmodel.split("@")[0]})'
@@ -1389,6 +1395,159 @@ def _render_scoring_summary(summary, config, baseline_summary=None):
         html += f'<td>—</td><td><span class="{pw_status_cls}">{pw_status}</span></td></tr>\n'
 
     html += "</table>\n"
+    return html
+
+
+def _render_score_matrix(summary, config, baseline_summary=None):
+    """Render a case × judge heatmap matrix table.
+
+    When baseline_summary is provided, renders a unified interleaved matrix
+    where each case has two rows: current run (bold) and baseline (muted),
+    making it easy to compare scores side-by-side per case.
+    """
+    per_case = summary.get("per_case", {})
+    if not per_case:
+        return ""
+
+    judge_configs = config.get("judges", [])
+    judge_names = [jc.get("name", "") for jc in judge_configs if jc.get("name")]
+    if not judge_names:
+        return ""
+
+    def _abbrev(name):
+        abbrevs = {
+            "instruction_adherence": "instr",
+            "output_quality": "out_q",
+            "evidence_grounding": "ground",
+            "scope_quality": "scope",
+            "acceptance_criteria_quality": "accept",
+            "revision_quality": "revis",
+            "feasibility_quality": "feasib",
+            "self_consistency": "consist",
+            "pairwise_vs_baseline": "pairw",
+            "skill_awareness": "skill",
+            "reasoning_quality": "reason",
+            "input_evidence_used": "evid",
+            "trace_completeness": "trace",
+            "files_exist": "files",
+            "frontmatter_valid": "fmattr",
+            "run_report_exists": "report",
+            "recommendation_consistency": "rec_con",
+            "pipeline_flow": "flow",
+            "architecture_context_used": "arch",
+            "efficiency": "effic",
+            "grpo_reward": "grpo_r",
+        }
+        if name in abbrevs:
+            return abbrevs[name]
+        return name[:7]
+
+    def _cell_class(value, judge_name):
+        if value is None:
+            return "matrix-skip"
+        if isinstance(value, bool):
+            return "matrix-pass" if value else "matrix-fail"
+        if isinstance(value, (int, float)):
+            jc = next((j for j in judge_configs if j.get("name") == judge_name), {})
+            sr = jc.get("score_range")
+            if isinstance(sr, list) and len(sr) >= 2:
+                lo, hi = sr[0], sr[1]
+            elif jc.get("feedback_type") == "int" or isinstance(value, int):
+                lo, hi = 1, 10
+            else:
+                lo, hi = 0, 1
+            span = hi - lo
+            frac = (value - lo) / span if span else 0.5
+            if frac >= 0.75:
+                return "matrix-high"
+            elif frac >= 0.5:
+                return "matrix-good"
+            elif frac >= 0.25:
+                return "matrix-mid"
+            else:
+                return "matrix-fail"
+        return ""
+
+    def _cell_display(value):
+        if value is None:
+            return "\u2014"
+        if isinstance(value, bool):
+            return "\u2713" if value else "\u2717"
+        if isinstance(value, float):
+            return f"{value:.1f}"
+        return str(value)
+
+    def _compute_reward(case_results):
+        reward_cfg = config.get("reward", {})
+        if reward_cfg.get("formula") == "weighted":
+            weights = reward_cfg.get("weights", {})
+            score_range = reward_cfg.get("score_range", [1, 5])
+            lo, hi = score_range[0], score_range[1]
+            total_w = 0.0
+            weighted_sum = 0.0
+            for wj, w in weights.items():
+                rec = case_results.get(wj, {})
+                v = rec.get("value") if isinstance(rec, dict) else None
+                if v is not None and isinstance(v, (int, float)):
+                    norm = (v - lo) / (hi - lo) if hi > lo else 0
+                    weighted_sum += w * max(0.0, min(1.0, norm))
+                    total_w += w
+            return (weighted_sum / total_w) if total_w else None
+        return None
+
+    def _render_row(case_results, case_label, css_class=""):
+        row = f'<tr class="{css_class}"><td class="matrix-case-cell">{_esc(case_label)}</td>'
+        for jn in judge_names:
+            rec = case_results.get(jn, {})
+            val = rec.get("value") if isinstance(rec, dict) else None
+            cls = _cell_class(val, jn)
+            row += f'<td class="{cls}">{_cell_display(val)}</td>'
+        reward_val = _compute_reward(case_results)
+        if reward_val is not None:
+            cls = "matrix-high" if reward_val >= 0.7 else "matrix-mid" if reward_val >= 0.4 else "matrix-fail"
+            row += f'<td class="{cls}">{reward_val:.2f}</td>'
+        else:
+            row += '<td>\u2014</td>'
+        row += '</tr>\n'
+        return row
+
+    has_bl = baseline_summary and baseline_summary.get("per_case")
+    bl_per_case = baseline_summary.get("per_case", {}) if has_bl else {}
+    all_cases = sorted(set(per_case.keys()) | set(bl_per_case.keys()))
+
+    # Determine run labels
+    cur_label = summary.get("run_id", "Current")
+    if isinstance(cur_label, str) and len(cur_label) > 20:
+        cur_label = cur_label.split("-202")[0] if "-202" in cur_label else cur_label[:20]
+    bl_label = ""
+    if has_bl:
+        bl_label = baseline_summary.get("run_id", "Baseline")
+        if isinstance(bl_label, str) and len(bl_label) > 20:
+            bl_label = bl_label.split("-202")[0] if "-202" in bl_label else bl_label[:20]
+
+    html = '<h2>Score Matrix</h2>\n'
+    if has_bl:
+        html += (f'<p class="section-intro" style="font-size:0.85em">'
+                 f'<span style="font-weight:600">\u25A0</span> {_esc(cur_label)} '
+                 f'&nbsp;&nbsp;<span style="font-weight:600;opacity:0.5">\u25A1</span> '
+                 f'<span style="opacity:0.6">{_esc(bl_label)}</span></p>\n')
+    html += '<div class="matrix-wrap"><table class="score-matrix">\n'
+    html += '<thead><tr><th class="matrix-case-hdr">Case</th>'
+    for jn in judge_names:
+        html += f'<th class="matrix-judge-hdr" title="{_esc(jn)}">{_esc(_abbrev(jn))}</th>'
+    html += '<th class="matrix-judge-hdr" title="reward">R</th></tr></thead>\n<tbody>\n'
+
+    for case_id in all_cases:
+        short_case = case_id[:30]
+        cur_case = per_case.get(case_id, {})
+        if isinstance(cur_case, dict) and cur_case:
+            html += _render_row(cur_case, short_case, "")
+        if has_bl:
+            bl_case = bl_per_case.get(case_id, {})
+            if isinstance(bl_case, dict) and bl_case:
+                html += _render_row(bl_case, "", "baseline-row")
+
+    html += '</tbody></table></div>\n'
     return html
 
 
@@ -1982,6 +2141,13 @@ def _render_reward_overview(summary, config, reward_cfg=None):
     except ImportError:
         pass
 
+    # Normalize reward_cfg to a plain dict (compose_reward calls .get())
+    if reward_cfg is not None and hasattr(reward_cfg, "__dataclass_fields__"):
+        from dataclasses import asdict
+        reward_cfg = asdict(reward_cfg)
+    elif reward_cfg is None:
+        reward_cfg = config.get("reward")
+
     # Builtin judges cover both LLM-prompt scorers (quality/, safety/) and
     # deterministic Python callables (efficiency/, process/), all stamped
     # judge_type="builtin" by score.py. Consult the registry to disambiguate
@@ -2117,7 +2283,7 @@ def _render_reward_overview(summary, config, reward_cfg=None):
         if _compose_reward is not None:
             try:
                 reward_val, metrics = _compose_reward(
-                    case_results, reward_cfg=reward_cfg)
+                    case_results, reward_config=reward_cfg)
                 # compose_reward returns 1.0 when all judges are None/skipped;
                 # treat as unscored instead of inflating the average.
                 if not metrics:
@@ -2654,6 +2820,7 @@ def generate_report(config, summary, run_result, run_dir,
     html += _wrap_section(_render_run_config(run_result, baseline_result))
     html += _render_analysis(run_dir, summary, run_result, baseline_summary)
     html += _wrap_section(_render_scoring_summary(summary, config, baseline_summary))
+    html += _wrap_section(_render_score_matrix(summary, config, baseline_summary))
     html += _wrap_section(_render_regressions(summary, config))
     html += _wrap_section(_render_shared_outputs(run_dir, config))
     html += _wrap_section(_render_reward_overview(summary, config, reward_cfg))
@@ -2702,19 +2869,6 @@ def main():
                       or any(ord(c) < 32 for c in eval_name)):
         print(f"ERROR: invalid skill name: {eval_name!r}", file=sys.stderr)
         sys.exit(1)
-    # Validate run_id / baseline to prevent path traversal (CWE-22)
-    for _arg_name, _arg_val in [("--run-id", args.run_id),
-                                ("--baseline", args.baseline)]:
-        if _arg_val is None:
-            continue
-        if (not isinstance(_arg_val, str) or not _arg_val
-                or "/" in _arg_val or "\\" in _arg_val
-                or _arg_val in (".", "..")
-                or any(ord(c) < 32 for c in _arg_val)):
-            print(f"ERROR: {_arg_name} must be a single path segment: {_arg_val!r}",
-                  file=sys.stderr)
-            sys.exit(1)
-
     runs_base = Path(os.environ.get("AGENT_EVAL_RUNS_DIR", "eval/runs"))
     runs_dir = runs_base / eval_name if eval_name else runs_base
     run_dir = runs_dir / args.run_id

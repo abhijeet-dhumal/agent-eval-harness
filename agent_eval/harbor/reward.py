@@ -11,12 +11,12 @@ container, the verifier (``tests/test.sh``) calls this module, which reuses
 the same engine the local ``/eval-run`` path uses — so per-case grading is
 identical whether run locally or in a Harbor trial.
 
-Reward composition (resolution order):
-1. If a ``reward:`` section exists in eval.yaml, use its formula/weights
-   to compose the reward from judge results. Supports ``weighted``,
-   single judge reference, or Python expression modes.
-2. Otherwise: boolean judges gate (any fail -> 0.0), numeric judges
-   normalized to [0,1] and averaged.
+Reward composition (default, configurable):
+- Boolean judges (inline ``check`` + bool LLM judges) are GATES: if any fails,
+  the overall ``reward`` is 0.0.
+- Numeric judges (score LLM judges, 1-5) are normalized to 0-1 via
+  ``(score - 1) / 4`` and averaged.
+- If all gates pass and there are no numeric judges, ``reward`` is 1.0.
 
 Pairwise comparison and regression thresholds are SUITE-level (need >=2 runs /
 the full set) and stay above Harbor — they are not computed here.
@@ -26,142 +26,20 @@ Usage:
         [--run-id <id>] [--out-dir /logs/verifier]
 """
 
-import agent_eval._bootstrap  # noqa: F401 — auto-activate venv before 3p imports
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
-import ast
+from agent_eval.config import EvalConfig
 
-from agent_eval.config import EvalConfig, RewardConfig
-
-_SCORE_MIN_DEFAULT = 1.0
-_SCORE_MAX_DEFAULT = 5.0
-
-_SAFE_AST_NODES = (
-    ast.Module, ast.Expr, ast.Expression, ast.Assign,
-    ast.BinOp, ast.UnaryOp, ast.Compare,
-    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod,
-    ast.USub, ast.UAdd,
-    ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.Eq, ast.NotEq,
-    ast.Constant, ast.Name, ast.Load, ast.Store,
-    ast.Call, ast.List, ast.Tuple,
-    ast.IfExp, ast.BoolOp, ast.And, ast.Or,
-)
-# ast.Pow (**) is intentionally excluded: integer exponentiation is the cheap
-# path to a CPU/memory blow-up (e.g. 2 ** 10**9) and reward formulas never need
-# it. Reward formulas are bounded numeric arithmetic, so cap overall size and
-# literal magnitude as defence-in-depth even though eval.yaml is trusted config.
-_MAX_FORMULA_NODES = 200
-_MAX_CONSTANT_ABS = 1e6
-
-# Functions callable from within a reward formula expression. The keys double
-# as the allow-list of permitted call names during AST validation.
-_SAFE_FUNCS = {
-    "min": min, "max": max, "abs": abs, "round": round,
-    "sum": sum, "len": len,
-    "mean": lambda xs: sum(xs) / len(xs) if xs else 0.0,
-}
-
-
-def _validate_ast(node: ast.AST, allowed_calls: set[str]) -> None:
-    """Walk AST and reject any node not in the safe allowlist."""
-    if not isinstance(node, _SAFE_AST_NODES):
-        raise ValueError(
-            f"Disallowed expression node: {type(node).__name__}")
-    if isinstance(node, ast.Call):
-        if not (isinstance(node.func, ast.Name)
-                and node.func.id in allowed_calls):
-            func_name = getattr(node.func, 'id', '?')
-            raise ValueError(
-                f"Disallowed function call: {func_name}")
-    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-        if node.id.startswith('_'):
-            raise ValueError(
-                f"Disallowed variable name: {node.id}")
-    if isinstance(node, ast.Constant):
-        v = node.value
-        if isinstance(v, bool) or v is None:
-            pass  # bool/None are fine (e.g. ternary fallbacks)
-        elif isinstance(v, (int, float)):
-            if abs(v) > _MAX_CONSTANT_ABS:
-                raise ValueError(f"Constant magnitude too large: {v}")
-        else:
-            # Reject str/bytes constants — they have no place in numeric
-            # arithmetic and enable repetition blow-ups (e.g. "x" * 10**6).
-            raise ValueError(
-                f"Disallowed constant type: {type(v).__name__}")
-    for child in ast.iter_child_nodes(node):
-        _validate_ast(child, allowed_calls)
-
-
-def _parse_and_validate(formula: str, allowed_calls: set[str]) -> ast.Module:
-    """Parse a formula and reject anything outside the safe subset.
-
-    Enforces: parses cleanly, stays under the node-count cap, uses only
-    allow-listed AST nodes/calls/constants, and ends in an expression (the
-    return value). Returns the parsed module for evaluation.
-    """
-    try:
-        tree = ast.parse(formula.strip(), mode="exec")
-    except SyntaxError as exc:
-        raise ValueError(f"could not parse formula: {exc}") from exc
-    node_count = sum(1 for _ in ast.walk(tree))
-    if node_count > _MAX_FORMULA_NODES:
-        raise ValueError(
-            f"reward formula too complex ({node_count} nodes > "
-            f"{_MAX_FORMULA_NODES})")
-    _validate_ast(tree, allowed_calls)
-    if not tree.body:
-        raise ValueError("Empty reward formula")
-    if not isinstance(tree.body[-1], ast.Expr):
-        raise ValueError(
-            "Last line of reward formula must be an expression "
-            "(the return value), not an assignment")
-    return tree
-
-
-def _safe_eval_formula(formula: str, variables: dict[str, float],
-                       safe_funcs: dict) -> float:
-    """Evaluate a reward formula using AST validation (no raw exec/eval).
-
-    The formula is parsed as a Python module. All statements except the
-    last must be assignments. The last statement must be an expression
-    whose value is returned as the reward.
-    """
-    tree = _parse_and_validate(formula, set(safe_funcs.keys()))
-    last_stmt = tree.body[-1]
-
-    ns = {**variables, **safe_funcs}
-
-    if len(tree.body) > 1:
-        setup = ast.Module(body=tree.body[:-1], type_ignores=[])
-        ast.fix_missing_locations(setup)
-        code = compile(setup, "<reward>", "exec")
-        exec(code, {"__builtins__": {}}, ns)  # noqa: S102 — AST-validated
-
-    expr = ast.Expression(body=last_stmt.value)
-    ast.fix_missing_locations(expr)
-    code = compile(expr, "<reward>", "eval")
-    return eval(code, {"__builtins__": {}}, ns)  # noqa: S307 — AST-validated
-
-
-def validate_formula(formula: str) -> None:
-    """Parse and AST-validate a reward formula without evaluating it.
-
-    Raises ``ValueError`` if the formula is syntactically invalid, uses a
-    disallowed construct/function, or does not end in an expression. Called at
-    config-load time (see ``EvalConfig.from_yaml``) so a malformed or unsafe
-    formula fails loudly there instead of silently yielding reward 0.0 on
-    every case during a run. Note this validates structure only; runtime
-    failures (e.g. an undefined judge name, division by zero) are still
-    caught at evaluation time and degrade to reward 0.0 with a warning.
-    """
-    _parse_and_validate(formula, set(_SAFE_FUNCS))
-
+# Numeric LLM judges emit an integer score in this inclusive range
+# (see _SCORE_JUDGE_TOOL in score.py). Used to normalize to 0-1.
+_SCORE_MIN = 1.0
+_SCORE_MAX = 5.0
 
 # Harbor's canonical verifier output directory inside the container.
 _DEFAULT_OUT_DIR = "/logs/verifier"
@@ -203,117 +81,24 @@ def score_case(config: EvalConfig, case_dir: Path,
     return result.get("per_case", {}).get(case_dir.name, {})
 
 
-def _extract_metrics(per_judge: dict) -> dict[str, float]:
-    """Build flat metric dict from per-judge results."""
-    metrics: dict[str, float] = {}
-    for name, rec in per_judge.items():
-        value = rec.get("value")
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            metrics[name] = 1.0 if value else 0.0
-        elif isinstance(value, (int, float)):
-            metrics[name] = float(value)
-    return metrics
-
-
-def _normalize(value: float, score_range: list[float]) -> float:
-    """Normalize a score to [0, 1] given a [min, max] range."""
-    lo, hi = score_range
-    span = hi - lo
-    if span <= 0:
-        return 0.0
-    return max(0.0, min(1.0, (value - lo) / span))
-
-
-def _judge_value(per_judge: dict, name: str,
-                 score_range: list[float],
-                 raw_judges: list[str] = ()) -> Optional[float]:
-    """Extract a judge's value as a float in [0, 1]."""
-    rec = per_judge.get(name, {})
-    val = rec.get("value")
-    if val is None:
-        return None
-    if isinstance(val, bool):
-        return 1.0 if val else 0.0
-    if isinstance(val, (int, float)):
-        if name in raw_judges:
-            return max(0.0, min(1.0, float(val)))
-        return _normalize(float(val), score_range)
-    return None
-
-
-def compute_reward_from_config(per_judge: dict,
-                               reward_cfg: RewardConfig) -> float:
-    """Compute reward using the eval.yaml reward: section.
-
-    Resolution within the section:
-    - ``judge``: that single judge's value is the reward (clamped to [0, 1],
-      or normalized via score_range when ``normalize`` is set).
-    - "weighted": weighted sum of ``weights``.
-    - "<expression>": Python expression with judge names as variables.
-    """
-    score_range = reward_cfg.score_range
-    raw_judges = reward_cfg.raw
-
-    if reward_cfg.gate:
-        for name, rec in per_judge.items():
-            val = rec.get("value")
-            if isinstance(val, bool) and not val:
-                return 0.0
-
-    # Single-judge mode: the judge's value IS the reward. Clamp as-is by
-    # default; normalize via score_range only when asked. A missing/skipped
-    # judge (value None) scores 0.0.
-    if reward_cfg.judge is not None:
-        clamp_raw = () if reward_cfg.normalize else (reward_cfg.judge,)
-        jv = _judge_value(per_judge, reward_cfg.judge, score_range, clamp_raw)
-        return jv if jv is not None else 0.0
-
-    formula = reward_cfg.formula.strip()
-
-    if formula == "weighted":
-        if not reward_cfg.weights:
-            return 0.0
-        total = 0.0
-        weight_sum = 0.0
-        for judge_name, weight in reward_cfg.weights.items():
-            jv = _judge_value(per_judge, judge_name, score_range, raw_judges)
-            if jv is not None:
-                total += float(weight) * jv
-                weight_sum += float(weight)
-        return max(0.0, min(1.0, total / weight_sum)) if weight_sum > 0 else 0.0
-
-    judge_vars: dict[str, float] = {}
-    for name, rec in per_judge.items():
-        jv = _judge_value(per_judge, name, score_range, raw_judges)
-        if jv is not None:
-            judge_vars[name] = jv
-
-    try:
-        result = _safe_eval_formula(formula, judge_vars, _SAFE_FUNCS)
-        return max(0.0, min(1.0, float(result)))
-    except Exception as exc:
-        print(f"Warning: reward formula evaluation failed: {exc}",
-              file=sys.stderr)
-        return 0.0
-
-
-def compose_reward(per_judge: dict, *,
-                   score_min: float = _SCORE_MIN_DEFAULT,
-                   score_max: float = _SCORE_MAX_DEFAULT,
-                   reward_cfg: Optional[RewardConfig] = None) -> tuple[float, dict]:
+def compose_reward(per_judge: dict,
+                   reward_config: dict | None = None) -> tuple[float, dict]:
     """Collapse per-judge results into an overall reward + flat metric dict.
 
-    Resolution order:
-    1. If reward_cfg is provided (from eval.yaml reward: section), use it.
-    2. Otherwise fall back to: boolean gates + average of normalized numerics.
-    """
-    metrics = _extract_metrics(per_judge)
+    Returns ``(reward, metrics)`` where ``metrics`` maps each judge name to a
+    number (bool -> 1.0/0.0, numeric -> raw score). Judges that were skipped
+    (condition false) or errored have ``value is None`` and are recorded with
+    no value rather than gated on.
 
-    if reward_cfg is not None:
-        reward = compute_reward_from_config(per_judge, reward_cfg)
-        return reward, metrics
+    When ``reward_config`` is provided with ``formula: weighted``, uses
+    explicit per-judge weights and score_range for normalization instead of
+    the default gate+mean behavior. Setting ``gate: false`` disables boolean
+    gating entirely (partial credit for GRPO training).
+    """
+    metrics: dict[str, float] = {}
+
+    if reward_config and reward_config.get("formula") == "weighted":
+        return _compose_weighted(per_judge, reward_config, metrics)
 
     gate_ok = True
     normalized_scores: list[float] = []
@@ -322,11 +107,14 @@ def compose_reward(per_judge: dict, *,
         value = rec.get("value")
         if value is None:
             continue
-        if isinstance(value, bool) and not value:
-            gate_ok = False
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            span = score_max - score_min
-            norm = (float(value) - score_min) / span if span else 0.0
+        if isinstance(value, bool):
+            metrics[name] = 1.0 if value else 0.0
+            if not value:
+                gate_ok = False
+        elif isinstance(value, (int, float)):
+            metrics[name] = float(value)
+            span = _SCORE_MAX - _SCORE_MIN
+            norm = (float(value) - _SCORE_MIN) / span if span else 0.0
             normalized_scores.append(max(0.0, min(1.0, norm)))
 
     if not gate_ok:
@@ -338,6 +126,68 @@ def compose_reward(per_judge: dict, *,
     return reward, metrics
 
 
+def _compose_weighted(per_judge: dict, reward_config: dict,
+                      metrics: dict) -> tuple[float, dict]:
+    """Weighted reward composition for GRPO training.
+
+    Uses ``reward_config.weights`` for per-judge contribution and
+    ``reward_config.score_range`` for numeric normalization bounds.
+
+    Boolean judges listed in ``weights`` contribute as 0.0/1.0 (tool/pipeline
+    soft terms). Numeric judges use ``(score - lo) / (hi - lo)``.
+    """
+    weights = reward_config.get("weights", {})
+    score_range = reward_config.get("score_range", [_SCORE_MIN, _SCORE_MAX])
+    use_gates = reward_config.get("gate", True)
+    lo, hi = float(score_range[0]), float(score_range[1])
+    span = hi - lo
+
+    gate_ok = True
+    weighted_sum = 0.0
+    total_weight = 0.0
+
+    for name, rec in per_judge.items():
+        value = rec.get("value")
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            # Bool → 0/1. When listed in weights, contribute to reward (soft
+            # tool/pipeline terms). When gate:true, any False still zeros all.
+            metrics[name] = 1.0 if value else 0.0
+            if use_gates and not value:
+                gate_ok = False
+            w = weights.get(name, 0.0)
+            if w > 0:
+                weighted_sum += w * metrics[name]
+                total_weight += w
+            continue
+        if isinstance(value, (int, float)):
+            metrics[name] = float(value)
+            norm = (float(value) - lo) / span if span else 0.0
+            norm = max(0.0, min(1.0, norm))
+            w = weights.get(name, 0.0)
+            if w > 0:
+                weighted_sum += w * norm
+                total_weight += w
+
+    if use_gates and not gate_ok:
+        return 0.0, metrics
+
+    if total_weight > 0:
+        reward = weighted_sum / total_weight
+    else:
+        reward = 0.5
+    return reward, metrics
+
+
+def _extract_reward_config(config: EvalConfig) -> dict | None:
+    """Extract the reward composition config from eval.yaml if present."""
+    raw = getattr(config, "_raw", None)
+    if raw and isinstance(raw, dict):
+        return raw.get("reward")
+    return None
+
+
 def build_reward(config: EvalConfig, case_dir: Path,
                  run_id: Optional[str] = None) -> dict:
     """Score a case and build the full reward payload.
@@ -346,10 +196,8 @@ def build_reward(config: EvalConfig, case_dir: Path,
     the full ``per_judge`` detail (value + rationale) for the sidecar.
     """
     per_judge = score_case(config, case_dir, run_id=run_id)
-
-    reward_cfg = getattr(config, "reward", None)
-
-    reward, metrics = compose_reward(per_judge, reward_cfg=reward_cfg)
+    reward_config = _extract_reward_config(config)
+    reward, metrics = compose_reward(per_judge, reward_config=reward_config)
     return {"reward": reward, "metrics": metrics, "per_judge": per_judge}
 
 
@@ -376,6 +224,23 @@ def write_reward(payload: dict, out_dir: Path, case_dir: Optional[Path] = None) 
         (case_dir / "judges.json").write_text(sidecar)
 
 
+def _redirect_judge_env() -> None:
+    """Point the Anthropic client at the judge endpoint when EVAL_JUDGE_* is set.
+
+    In GRPO training, ANTHROPIC_BASE_URL points at the policy vLLM (for the
+    agent). The judge needs a different endpoint (e.g. litellm-gateway for
+    Claude Opus). Swapping the env vars here ensures score.py's
+    _get_anthropic_client() picks up the judge endpoint without needing a
+    modified score.py in the container image.
+    """
+    judge_base = os.environ.get("EVAL_JUDGE_BASE_URL")
+    if judge_base:
+        os.environ["ANTHROPIC_BASE_URL"] = judge_base
+    judge_key = os.environ.get("EVAL_JUDGE_API_KEY")
+    if judge_key:
+        os.environ["ANTHROPIC_API_KEY"] = judge_key
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -390,6 +255,8 @@ def main() -> None:
     parser.add_argument("--out-dir", default=_DEFAULT_OUT_DIR,
                         help=f"Where to write reward files (default: {_DEFAULT_OUT_DIR})")
     args = parser.parse_args()
+
+    _redirect_judge_env()
 
     config = EvalConfig.from_yaml(args.config)
     case_dir = Path(args.case_dir).resolve()

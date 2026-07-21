@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 _KNOWN_TOOLS = [
     "AskUserQuestion", "Bash", "Read", "Write", "Edit",
-    "Glob", "Grep", "Agent", "Skill",
+    "Glob", "Grep", "Agent", "Task", "Skill",
 ]
 
 _INTERCEPTOR_SCRIPT = (
@@ -51,7 +51,10 @@ def extract_tool_patterns(match_text: str) -> list[str]:
         patterns.append(m.group(1))
     if not patterns and ("script" in match_text.lower() or "api" in match_text.lower()):
         patterns.append("Bash")
-    return patterns or ["*"]
+    if not patterns and "jira" in match_text.lower():
+        # Jira interactions are Bash-only; never fall back to "*" (blocks all tools).
+        patterns.append("Bash")
+    return patterns
 
 
 def build_handlers(config: "EvalConfig") -> tuple[dict, set[str]]:

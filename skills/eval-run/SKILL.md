@@ -26,7 +26,6 @@ Parse `$ARGUMENTS`:
 | `--gold` | no | false | Save outputs as gold references after run |
 | `--effort <level>` | no | `runner.effort` from config | Claude Code reasoning effort (Claude Code only; ignored by other runners) |
 | `--runner <type>` | no | local | `local` (default Steps 1–8) or `harbor` (containerized — skips to Harbor runner section) |
-| `--env <name>` | no | `kubernetes` | Harbor execution environment: `podman`, `kubernetes`, `openshift` (only with `--runner harbor`) |
 
 If `--runner harbor`: after config discovery, **skip to the Harbor runner section** below. Steps 2–6 are replaced by one `run.py` call.
 
@@ -263,25 +262,13 @@ it handles task generation (or reuse), `harbor run`, per-case judging (in-contai
 result mapping, and report generation in one call:
 
 ```bash
-# Run under the eval-harness venv interpreter so compiled deps load with the
-# correct ABI and the process is never re-exec'd mid-run. Falls back to system
-# python3 if the venv is absent. The venv holds only third-party deps, so the
-# plugin root (source of the agent_eval package) must be on PYTHONPATH.
-PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$CLAUDE_SKILL_DIR/../..}"
-VENV_PY="$PLUGIN_ROOT/.eval-venv/bin/python3"
-[ -x "$VENV_PY" ] || VENV_PY=python3
-
-PYTHONPATH="$PLUGIN_ROOT:$(pwd)${PYTHONPATH:+:$PYTHONPATH}" "$VENV_PY" -m agent_eval.harbor.run \
+PYTHONPATH="$(pwd)" python3 -m agent_eval.harbor.run \
     --config <config> --model <model> \
     --output $AGENT_EVAL_RUNS_DIR/<eval-name>/<run-id> \
     --tasks-dir <tasks-dir> --jobs-dir <tmp-jobs> \
     [--image <image>] [--agent <agent>] [--n-concurrent N] \
-    [--env kubernetes]
+    [--environment-import-path agent_eval.harbor.kubernetes:KubernetesEnvironment]
 ```
-
-Cluster-specific config (namespace, credentials secret) is read from a
-`.env` file in the project root. Create it with `AGENT_EVAL_K8S_NAMESPACE`
-and `AGENT_EVAL_K8S_CREDENTIALS_SECRET` — `run.py` loads it automatically.
 
 Tasks come from `/eval-dataset` (which emits Harbor task packages via
 `scripts/harbor.py`). If `--tasks-dir` already has them, `run.py` reuses them; if
@@ -297,11 +284,7 @@ runner instead — it creates ConfigMaps, submits a job to EvalHub, polls for
 completion, and maps the results back:
 
 ```bash
-PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$CLAUDE_SKILL_DIR/../..}"
-VENV_PY="$PLUGIN_ROOT/.eval-venv/bin/python3"
-[ -x "$VENV_PY" ] || VENV_PY=python3
-
-PYTHONPATH="$PLUGIN_ROOT:$(pwd)${PYTHONPATH:+:$PYTHONPATH}" "$VENV_PY" -m agent_eval.evalhub.runner \
+python3 -m agent_eval.evalhub.runner \
     --config <config> --model <model> \
     --output $AGENT_EVAL_RUNS_DIR/<eval-name>/<run-id> \
     [--evalhub-url <url>] [--namespace <ns>] [--project-dir <path>]

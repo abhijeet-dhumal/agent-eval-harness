@@ -22,13 +22,13 @@ def get_experiment_id(experiment_name: str) -> Optional[str]:
 
 
 def resolve_tracking_uri(config) -> str:
-    """Resolve MLflow tracking URI with config precedence.
+    """Resolve MLflow tracking URI.
 
-    Precedence: config.mlflow.tracking_uri > MLFLOW_TRACKING_URI env var
-    > local default (http://127.0.0.1:5000).
+    Precedence: MLFLOW_TRACKING_URI env var (explicit override for local
+    port-forward) > config.mlflow.tracking_uri > default.
     """
-    return (config.mlflow.tracking_uri
-            or os.environ.get("MLFLOW_TRACKING_URI")
+    return (os.environ.get("MLFLOW_TRACKING_URI")
+            or config.mlflow.tracking_uri
             or "http://127.0.0.1:5000")
 
 

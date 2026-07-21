@@ -18,7 +18,9 @@ from pathlib import Path
 def iso_to_ns(ts_str):
     """Convert ISO 8601 timestamp string to nanoseconds since epoch."""
     from dateutil.parser import parse as _dt_parse
-    return int(_dt_parse(ts_str).timestamp() * 1e9)
+
+    ns = int(_dt_parse(ts_str).timestamp() * 1e9)
+    return max(0, min(ns, 9_223_372_036_854_775_807))
 
 
 def make_span(trace_id, parent_id, name, span_type, start_ns, end_ns,
@@ -40,8 +42,8 @@ def make_span(trace_id, parent_id, name, span_type, start_ns, end_ns,
         "span_id": span_id,
         "parent_span_id": parent_id,
         "name": name,
-        "start_time_unix_nano": start_ns,
-        "end_time_unix_nano": end_ns,
+        "start_time_unix_nano": int(start_ns),
+        "end_time_unix_nano": int(end_ns),
         "events": [],
         "status": {"code": "STATUS_CODE_OK", "message": ""},
         "attributes": attrs,
@@ -785,26 +787,14 @@ def build_trace(stdout_path, run_result, run_id, experiment_id,
                     trace_cost[m_name] = m_stats["cost_usd"]
         trace_metadata["mlflow.trace.cost"] = json.dumps(trace_cost)
     if token_usage:
-        # Follow MLflow's anthropic / claude_code token-usage convention so the
-        # Usage dashboard renders Input / Output / Cache Read / Cache Write as
-        # distinct lines: input_tokens is the NON-cached (fresh) input, cache
-        # tokens are separate optional keys, and total_tokens = input + output
-        # (cache excluded). The cache lines carry the bulk of the volume; cost
-        # stays separate via mlflow.llm.cost / mlflow.trace.cost.
-        input_tokens = token_usage.get("input", 0)
+        input_tokens = (token_usage.get("input", 0)
+                        + token_usage.get("cache_create", 0))
         output_tokens = token_usage.get("output", 0)
-        usage = {
+        trace_metadata["mlflow.trace.tokenUsage"] = json.dumps({
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
-        }
-        cache_read = token_usage.get("cache_read", 0)
-        cache_create = token_usage.get("cache_create", 0)
-        if cache_read:
-            usage["cache_read_input_tokens"] = cache_read
-        if cache_create:
-            usage["cache_creation_input_tokens"] = cache_create
-        trace_metadata["mlflow.trace.tokenUsage"] = json.dumps(usage)
+        })
     if session_id:
         trace_metadata["mlflow.trace.session"] = session_id
 

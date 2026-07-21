@@ -146,7 +146,7 @@ def generate_tasks(
         # task.toml
         (task_dir / "task.toml").write_text(_render("task.toml.tmpl", {
             "TASK_NAME": f"{config.name or 'eval'}/{case_id}",
-            "TASK_DESC": (config.description or config.name or "agent-eval task")[:120],
+            "TASK_DESC": (config.description or config.name or "agent-eval task").replace("\n", " ").strip()[:120],
             "EVAL_NAME": config.name,
             "CASE_ID": case_id,
             "IMAGE": image,
@@ -157,22 +157,12 @@ def generate_tasks(
 
         # instruction.md
         (task_dir / "instruction.md").write_text(_render("instruction.md.tmpl", {
-            "COMMAND": command,
+            "COMMAND": instruction,
         }))
 
         # tests/test.sh + bundled eval.yaml (verifier)
-        copy_lines = []
-        for out in config.outputs:
-            if out.path:
-                src = f'"{workdir}/{out.path}"'
-                dst = f'/logs/verifier/{out.path}'
-                copy_lines.append(
-                    f'mkdir -p "$(dirname {dst})" && '
-                    f'cp -r {src} {dst} 2>/dev/null || true')
-        copy_outputs = "\n".join(copy_lines) if copy_lines else "true"
         (task_dir / "tests" / "test.sh").write_text(_render("test.sh.tmpl", {
             "WORKDIR": workdir,
-            "COPY_OUTPUTS": copy_outputs,
         }))
         (task_dir / "tests" / "test.sh").chmod(0o755)
         (task_dir / "tests" / "eval.yaml").write_text(
